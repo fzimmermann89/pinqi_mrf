@@ -1,0 +1,151 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinqi-mrf"
+version = "0.1.0"
+description = "PINQI experiments for magnetic resonance fingerprinting."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "einops>=0.7.0",
+    "h5py>=3.10",
+    "lightning>=2.4",
+    "matplotlib>=3.8",
+    "mrtwo @ git+https://github.com/fzimmermann89/mr2@next",
+    "numpy>=1.23,<3.0",
+    "scipy>=1.15",
+    "torch>=2.3.1",
+    "torchvision>=0.18.1",
+    "tqdm>=4.60.0",
+    "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "typos",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore:Anomaly Detection has been enabled:UserWarning",
+    "ignore:TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled:UserWarning",
+    "ignore:`torch.jit.script` is deprecated:DeprecationWarning",
+    "ignore:`torch.jit.script_method` is deprecated",
+]
+markers = ["cuda : Tests only to be run when cuda device is available"]
+
+[tool.mypy]
+warn_return_any = false
+check_untyped_defs = true
+warn_no_return = true
+warn_unreachable = true
+exclude = ["docs"]
+enable_error_code = ["ignore-without-code"]
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+    "h5py",
+    "matplotlib.*",
+    "mr2.*",
+    "scipy.*",
+    "torchvision.*",
+    "wandb",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["__init__.py"]
+exclude = ["docs/**"]
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "ARG",
+    "B",
+    "C4",
+    "COM",
+    "D",
+    "E",
+    "F",
+    "FA",
+    "I",
+    "N",
+    "NPY",
+    "RUF",
+    "S",
+    "SIM",
+    "UP",
+    "PIE",
+    "PTH",
+    "T20",
+    "Q",
+    "W",
+    "YTT",
+    "ERA",
+]
+extend-select = [
+    "ANN001",
+    "ANN201",
+    "ANN205",
+    "ANN401",
+    "BLE001",
+    "D107",
+    "D417",
+]
+ignore = [
+    "N999",
+    "COM812",
+    "SIM108",
+    "A005",
+]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+split-on-trailing-comma = false
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+inline-quotes = "single"
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.format]
+quote-style = "single"
+skip-magic-trailing-comma = false
+
+[tool.typos.default]
+locale = "en-us"
+check-filename = false
+extend-ignore-re = [
+    "(?Rm)^.*(#|//)\\s*noqa:\\s*typos",
+]
+
+[tool.typos.default.extend-words]
+Reson = "Reson"
+iy = "iy"
+arange = "arange"
+Ba = "Ba"
+wht = "wht"
+ND = "ND"
+nd = "nd"
+
+[tool.coverage.paths]
+source = ["src", "*/site-packages"]
+
+[tool.coverage.run]
+disable_warnings = ["module-not-measured"]
