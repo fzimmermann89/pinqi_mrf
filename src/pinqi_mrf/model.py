@@ -1,16 +1,10 @@
 """PINQI-MRF model skeleton."""
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from typing import Any
 
 import einops
 import lightning.pytorch as pl
-import matplotlib
-
-matplotlib.use('Agg')
-
 import matplotlib.pyplot as plt
 import mr2
 import numpy as np
@@ -148,13 +142,14 @@ class PinqiModule(pl.LightningModule):
         n_subspace_coefficients: int,
         image_size: int,
         n_readout_samples: int,
+        n_coils: int,
         trajectory: str = 'radial',
         n_iterations: int = 4,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
         n_features_image_net: Sequence[int] = (32, 48, 64, 96),
-        lr: float = 1.5e-4,
-        weight_decay: float = 1e-3,
-        loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),
+        lr: float = 1.5e-4,  # noqa: ARG002
+        weight_decay: float = 1e-3,  # noqa: ARG002
+        loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
     ) -> None:
         """Initialize the Lightning module."""
         super().__init__()
@@ -233,9 +228,11 @@ class PinqiModule(pl.LightningModule):
         predictions: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         batch: BatchType,
     ) -> torch.Tensor:
-        """Compute parameter loss in normalized parameter space."""
+        """Compute parameter loss in standardized parameter space."""
         loss = torch.tensor(0.0, device=self.device)
-        target_m0, target_r1, target_r2, mask = map(torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask']))
+        target_m0, target_r1, target_r2, mask = map(
+            torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask'])
+        )
         for prediction, weight in zip(predictions, self.hparams.loss_weights, strict=True):
             prediction_m0, prediction_r1, prediction_r2 = map(torch.squeeze, prediction)
             loss_r1 = torch.nn.functional.mse_loss(prediction_r1[mask], target_r1[mask])
@@ -282,8 +279,8 @@ class PinqiModule(pl.LightningModule):
         if not self.trainer.is_global_zero or not self.validation_step_outputs:
             return
 
-        self._log_parameter_figure('r1', '$R_1$ normalized')
-        self._log_parameter_figure('r2', '$R_2$ normalized')
+        self._log_parameter_figure('r1', '$R_1$ standardized')
+        self._log_parameter_figure('r2', '$R_2$ standardized')
         self.validation_step_outputs.clear()
 
     def _log_parameter_figure(self, parameter_name: str, label: str) -> None:

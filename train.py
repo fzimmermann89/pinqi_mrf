@@ -1,7 +1,5 @@
 """Training entry point for PINQI-MRF experiments."""
 
-from __future__ import annotations
-
 import os
 
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -12,11 +10,11 @@ os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ['MPLBACKEND'] = 'Agg'
 os.environ['NCCL_P2P_DISABLE'] = '1'
 
-from argparse import ArgumentParser
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import lightning.pytorch as pl
+import matplotlib
 import mr2
 import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -24,8 +22,9 @@ from lightning.pytorch.loggers import WandbLogger
 
 from pinqi_mrf.data import DataModule
 from pinqi_mrf.model import LogLambdasCallback, PinqiModule
-from pinqi_mrf.signal_models import NeuroMRFSubspaceLookup
+from pinqi_mrf.signal_models import SubspaceLookup
 
+matplotlib.use('Agg')
 torch.set_num_threads(1)
 
 
@@ -45,10 +44,6 @@ def parse_args() -> Namespace:
     parser.add_argument('--trajectory', choices=['radial'], default='radial')
     parser.add_argument('--r1-steps', type=int, default=100)
     parser.add_argument('--r2-steps', type=int, default=100)
-    parser.add_argument('--r1-min', type=float, default=0.25)
-    parser.add_argument('--r1-max', type=float, default=5.0)
-    parser.add_argument('--r2-min', type=float, default=2.5)
-    parser.add_argument('--r2-max', type=float, default=100.0)
     parser.add_argument('--devices', default='auto')
     parser.add_argument('--accelerator', default='auto')
     parser.add_argument('--strategy', default='auto')
@@ -64,14 +59,10 @@ def main() -> None:
         args.data_folder.mkdir(parents=True, exist_ok=True)
         mr2.phantoms.brainweb.download_brainweb(output_directory=args.data_folder, workers=2, progress=True)
 
-    r1_bounds = (args.r1_min, args.r1_max)
-    r2_bounds = (args.r2_min, args.r2_max)
-    signalmodel = NeuroMRFSubspaceLookup(
+    signalmodel = SubspaceLookup(
+        signalmodel=mr2.operators.models.NeuroMRF(),
         n_subspace_coefficients=args.n_subspace_coefficients,
-        r1_bounds=r1_bounds,
-        r2_bounds=r2_bounds,
-        r1_steps=args.r1_steps,
-        r2_steps=args.r2_steps,
+        parameter_ranges=((-3.5, 4.0, args.r1_steps), (-2.5, 4.0, args.r2_steps)),
     )
     datamodule = DataModule(
         folder=args.data_folder,
@@ -79,14 +70,13 @@ def main() -> None:
         num_workers=args.num_workers,
         size=args.size,
         n_coils=args.n_coils,
-        r1_bounds=r1_bounds,
-        r2_bounds=r2_bounds,
     )
     model = PinqiModule(
         signalmodel=signalmodel,
         n_subspace_coefficients=args.n_subspace_coefficients,
         image_size=args.size,
         n_readout_samples=args.n_readout_samples,
+        n_coils=args.n_coils,
         trajectory=args.trajectory,
     )
 

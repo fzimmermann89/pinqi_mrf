@@ -1,3 +1,3 @@
 # PINQI MRF
 
-Project skeleton for PINQI magnetic resonance fingerprinting experiments.
+PINQI for magnetic resonance fingerprinting experiments.

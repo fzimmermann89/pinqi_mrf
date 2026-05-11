@@ -13,7 +13,7 @@ dependencies = [
     "h5py>=3.10",
     "lightning>=2.4",
     "matplotlib>=3.8",
-    "mrtwo @ git+https://github.com/fzimmermann89/mr2@next",
+    "mrtwo",
     "numpy>=1.23,<3.0",
     "scipy>=1.15",
     "torch>=2.3.1",
@@ -111,6 +111,7 @@ ignore = [
     "COM812",
     "SIM108",
     "A005",
+    "S101",
 ]
 
 [tool.ruff.lint.isort]

@@ -1,15 +1,13 @@
 """Experimental sampler for subspace rhs noise induced by white k-space noise."""
 
-from __future__ import annotations
-
 import math
 
+import mr2
 import torch
+from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
-from mr2.utils import normalize_index, unsqueeze_at, unsqueeze_right
 
-
-class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
+class WhiteKspaceSubspaceRhsNoiseSampler(mr2.utils.TensorAttributeMixin):
     r"""Sample coilwise rhs noise under a white k-space noise model.
 
     The sampler assumes a subspace Toeplitz Gram operator without coil sensitivities.
@@ -26,7 +24,7 @@ class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
     frequency block to the positive semidefinite cone before factorization.
     """
 
-    def __init__(self, subspace_gram_op: torch.nn.Module, n_coils: int) -> None:
+    def __init__(self, subspace_gram_op: SubspaceNonUniformFastFourierOpGramOp, n_coils: int) -> None:
         """Initialize the rhs noise sampler.
 
         Parameters
@@ -45,7 +43,6 @@ class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
         kernel = subspace_gram_op._kernel
         self._subspace_dim = subspace_gram_op._subspace_dim
         self._dim = tuple(subspace_gram_op._dim)
-        self._spatial_dim_indices = tuple(normalize_index(3, dim) for dim in self._dim)
         self._recon_shape = tuple(subspace_gram_op._recon_shape)
         self._n_coils = n_coils
         self._n_coefficients = kernel.shape[0]
@@ -55,8 +52,7 @@ class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
         eigenvalues, eigenvectors = torch.linalg.eigh(spectral_matrix)
         diagonal_scale = kernel.diagonal(dim1=0, dim2=1).real.mean().clamp_min(1e-12)
         eigenvalue_floor = 1e-6 * diagonal_scale
-        psd_factor = eigenvectors * eigenvalues.clamp_min(eigenvalue_floor).sqrt().unsqueeze(-2)
-        self.register_buffer('_psd_factor', psd_factor)
+        self._psd_factor = eigenvectors * eigenvalues.clamp_min(eigenvalue_floor).sqrt().unsqueeze(-2)
 
     def __call__(self, stddev: float | torch.Tensor) -> torch.Tensor:
         """Sample coilwise additive rhs noise.
@@ -82,10 +78,7 @@ class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
         output_ndim = stddev.ndim + 5
 
         white_shape = (self._n_coefficients, *batch_shape, self._n_coils, *self._psd_factor.shape[:-2])
-        white = (
-            torch.randn(white_shape, dtype=self._psd_factor.dtype, device=self._psd_factor.device)
-            / math.sqrt(2.0)
-        )
+        white = torch.randn(white_shape, dtype=self._psd_factor.dtype, device=self._psd_factor.device) / math.sqrt(2.0)
 
         noise = torch.einsum('...ab,b...->a...', self._psd_factor, white)
         spatial_dims = tuple(range(noise.ndim - len(self._dim), noise.ndim))
@@ -96,11 +89,7 @@ class WhiteKspaceSubspaceRhsNoiseSampler(torch.nn.Module):
             crop[dim] = slice(0, size)
         noise = noise[tuple(crop)]
 
-        for spatial_dim in range(3):
-            if spatial_dim not in self._spatial_dim_indices:
-                noise = unsqueeze_at(noise, spatial_dim - 3, 1)
-
-        noise = noise.movedim(0, normalize_index(noise.ndim, self._subspace_dim))
-        scale = unsqueeze_at(stddev, normalize_index(output_ndim, self._subspace_dim), 1)
-        scale = unsqueeze_right(scale, output_ndim - scale.ndim)
+        noise = noise.movedim(0, mr2.utils.normalize_index(noise.ndim, self._subspace_dim))
+        scale = mr2.utils.unsqueeze_at(stddev, mr2.utils.normalize_index(output_ndim, self._subspace_dim), 1)
+        scale = mr2.utils.unsqueeze_right(scale, output_ndim - scale.ndim)
         return scale * noise

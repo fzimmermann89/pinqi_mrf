@@ -1,15 +1,14 @@
 """Tests for white k-space rhs noise sampling."""
 
-from __future__ import annotations
-
+import mr2
 import torch
 
-from mr2.data import KTrajectory, SpatialDimension
-from mr2.operators import NonUniformFastFourierOp
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
 
 
-def create_time_varying_2d_nufft_op(n_timepoints: int = 4, image_shape: tuple[int, int] = (12, 10)) -> torch.nn.Module:
+def create_time_varying_2d_nufft_op(
+    n_timepoints: int = 4, image_shape: tuple[int, int] = (12, 10)
+) -> mr2.operators.NonUniformFastFourierOp:
     """Create a small 2D NUFFT with one radial spoke per time point."""
     angles = torch.linspace(0, torch.pi, n_timepoints + 1)[:-1]
     readout = torch.linspace(-image_shape[-1] / 2, image_shape[-1] / 2, image_shape[-1])
@@ -18,11 +17,11 @@ def create_time_varying_2d_nufft_op(n_timepoints: int = 4, image_shape: tuple[in
     kx = kx[:, None, :, :]
     ky = ky[:, None, :, :]
     kz = torch.zeros_like(kx)
-    trajectory = KTrajectory(kz=kz, ky=ky, kx=kx)
-    return NonUniformFastFourierOp(
+    trajectory = mr2.data.KTrajectory(kz=kz, ky=ky, kx=kx)
+    return mr2.operators.NonUniformFastFourierOp(
         direction=(-2, -1),
-        recon_matrix=SpatialDimension(z=1, y=image_shape[0], x=image_shape[1]),
-        encoding_matrix=SpatialDimension(z=1, y=image_shape[0], x=image_shape[1]),
+        recon_matrix=mr2.data.SpatialDimension(z=1, y=image_shape[0], x=image_shape[1]),
+        encoding_matrix=mr2.data.SpatialDimension(z=1, y=image_shape[0], x=image_shape[1]),
         traj=trajectory,
     )
 

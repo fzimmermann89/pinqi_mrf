@@ -1,7 +1,5 @@
 """Data generation for PINQI-MRF experiments."""
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -10,7 +8,7 @@ import lightning.pytorch as pl
 import mr2
 import torch
 
-from pinqi_mrf.parameters import relaxation_time_to_normalized_rate
+from pinqi_mrf.parameters import R1_STATS, R2_STATS, relaxation_time_to_standardized_rate
 
 
 class BatchType(TypedDict):
@@ -24,18 +22,18 @@ class BatchType(TypedDict):
     noise_std: torch.Tensor
 
 
-class BrainwebMRFDataset(torch.utils.data.Dataset):
-    """BrainWeb-based placeholder dataset for MRF parameter maps."""
+class BrainwebDataset(torch.utils.data.Dataset):
+    """BrainWeb-based dataset for parameter maps."""
 
     def __init__(
         self,
         folder: Path,
-        size: int,
-        n_coils: int,
-        noise: tuple[float, float],
-        r1_bounds: tuple[float, float],
-        r2_bounds: tuple[float, float],
-        orientation: Sequence[Literal['axial', 'coronal', 'sagittal']],
+        size: int = 192,
+        n_coils: int = 8,
+        noise: tuple[float, float] = (0.0, 0.1),
+        r1_stats: tuple[float, float] = R1_STATS,
+        r2_stats: tuple[float, float] = R2_STATS,
+        orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
         random: bool = True,
     ) -> None:
         """Initialize the dataset."""
@@ -56,14 +54,14 @@ class BrainwebMRFDataset(torch.utils.data.Dataset):
             what=('m0', 't1', 't2', 'mask'),
             seed='index' if not random else 'random',
             slice_preparation=augment,
-            parameters=mr2.phantoms.brainweb.VALUES_ULF_RANDOMIZED,
+            parameters=mr2.phantoms.brainweb.VALUES_3T_RANDOMIZED,
             orientation=orientation,
         )
         self.matrix_size = mr2.data.SpatialDimension(1, size, size)
         self.n_coils = n_coils
         self.noise = noise
-        self.r1_bounds = r1_bounds
-        self.r2_bounds = r2_bounds
+        self.r1_stats = r1_stats
+        self.r2_stats = r2_stats
         self.random = random
 
     def __len__(self) -> int:
@@ -78,8 +76,8 @@ class BrainwebMRFDataset(torch.utils.data.Dataset):
 
         return {
             'm0': phantom['m0'],
-            'r1': relaxation_time_to_normalized_rate(phantom['t1'], self.r1_bounds),
-            'r2': relaxation_time_to_normalized_rate(phantom['t2'], self.r2_bounds),
+            'r1': relaxation_time_to_standardized_rate(phantom['t1'], self.r1_stats),
+            'r2': relaxation_time_to_standardized_rate(phantom['t2'], self.r2_stats),
             'csm': mr2.phantoms.coils.birdcage_2d(
                 self.n_coils,
                 self.matrix_size,
@@ -101,8 +99,8 @@ class DataModule(pl.LightningDataModule):
         size: int = 192,
         n_coils: int = 8,
         noise: tuple[float, float] = (0.0, 0.1),
-        r1_bounds: tuple[float, float] = (0.25, 5.0),
-        r2_bounds: tuple[float, float] = (2.5, 100.0),
+        r1_stats: tuple[float, float] = R1_STATS,
+        r2_stats: tuple[float, float] = R2_STATS,
         batch_size: int = 4,
         num_workers: int = 4,
     ) -> None:
@@ -111,24 +109,24 @@ class DataModule(pl.LightningDataModule):
         self.save_hyperparameters(ignore=['folder', 'num_workers'])
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.train_dataset = BrainwebMRFDataset(
+        self.train_dataset = BrainwebDataset(
             folder=folder,
             size=size,
             n_coils=n_coils,
             noise=noise,
-            r1_bounds=r1_bounds,
-            r2_bounds=r2_bounds,
+            r1_stats=r1_stats,
+            r2_stats=r2_stats,
             orientation=('axial', 'coronal', 'sagittal'),
             random=True,
         )
         self.val_dataset = torch.utils.data.Subset(
-            BrainwebMRFDataset(
+            BrainwebDataset(
                 folder=folder,
                 size=size,
                 n_coils=n_coils,
                 noise=noise,
-                r1_bounds=r1_bounds,
-                r2_bounds=r2_bounds,
+                r1_stats=r1_stats,
+                r2_stats=r2_stats,
                 orientation=('axial',),
                 random=False,
             ),
