@@ -10,6 +10,20 @@ import torch
 
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, relaxation_time_to_standardized_rate
 
+BRAINWEB_VALUES_3T_RANDOMIZED = {
+    'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.05), (-0.2, 0.2)),
+    'gry': mr2.phantoms.brainweb.BrainwebTissue((1.200, 2.000), (0.080, 0.120), (0.70, 1.00), (-0.2, 0.2)),
+    'wht': mr2.phantoms.brainweb.BrainwebTissue((0.800, 1.500), (0.060, 0.100), (0.50, 0.90), (-0.2, 0.2)),
+    'csf': mr2.phantoms.brainweb.BrainwebTissue((2.000, 4.000), (1.300, 2.000), (0.90, 1.00), (-0.2, 0.2)),
+    'mrw': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.70, 1.00), (-0.2, 0.2)),
+    'dura': mr2.phantoms.brainweb.BrainwebTissue((2.000, 2.800), (0.200, 0.500), (0.90, 1.00), (-0.2, 0.2)),
+    'fat': mr2.phantoms.brainweb.BrainwebTissue((0.300, 0.500), (0.060, 0.100), (0.90, 1.00), (-0.2, 0.2)),
+    'fat2': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.60, 0.90), (-0.2, 0.2)),
+    'mus': mr2.phantoms.brainweb.BrainwebTissue((1.200, 1.500), (0.040, 0.060), (0.90, 1.00), (-0.2, 0.2)),
+    'm-s': mr2.phantoms.brainweb.BrainwebTissue((0.500, 0.900), (0.300, 0.500), (0.90, 1.00), (-0.2, 0.2)),
+    'ves': mr2.phantoms.brainweb.BrainwebTissue((1.700, 2.100), (0.200, 0.400), (0.80, 1.00), (-0.2, 0.2)),
+}
+
 
 class BatchType(TypedDict):
     """Type hint for a batch of data."""
@@ -54,7 +68,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
             what=('m0', 't1', 't2', 'mask'),
             seed='index' if not random else 'random',
             slice_preparation=augment,
-            parameters=mr2.phantoms.brainweb.VALUES_3T_RANDOMIZED,
+            parameters=BRAINWEB_VALUES_3T_RANDOMIZED,
             orientation=orientation,
         )
         self.matrix_size = mr2.data.SpatialDimension(1, size, size)
@@ -72,7 +86,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         """Get one training sample."""
         phantom = self.phantom[index]
         seed = int(torch.randint(0, 1000000, (1,))) if self.random else index
-        rng = mr2.utils.RandomGenerator.RandomGenerator(seed)
+        rng = mr2.utils.RandomGenerator(seed)
 
         return {
             'm0': phantom['m0'],
@@ -95,38 +109,59 @@ class DataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        folder: Path,
+        folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         size: int = 192,
         n_coils: int = 8,
         noise: tuple[float, float] = (0.0, 0.1),
         r1_stats: tuple[float, float] = R1_STATS,
         r2_stats: tuple[float, float] = R2_STATS,
-        batch_size: int = 4,
-        num_workers: int = 4,
+        batch_size: int = 8,
+        num_workers: int = 8,
     ) -> None:
         """Initialize the data module."""
         super().__init__()
         self.save_hyperparameters(ignore=['folder', 'num_workers'])
+        self.folder = folder
+        self.size = size
+        self.n_coils = n_coils
+        self.noise = noise
+        self.r1_stats = r1_stats
+        self.r2_stats = r2_stats
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.train_dataset: BrainwebDataset | None = None
+        self.val_dataset: torch.utils.data.Subset[BrainwebDataset] | None = None
+
+    def prepare_data(self) -> None:
+        """Download BrainWeb data if it is not available locally."""
+        if not self.folder.exists():
+            self.folder.mkdir(parents=True, exist_ok=True)
+            mr2.phantoms.brainweb.download_brainweb(output_directory=self.folder, workers=2, progress=True)
+
+    def setup(self, stage: str | None = None) -> None:
+        """Create training and validation datasets."""
+        _ = stage
+        if self.train_dataset is not None and self.val_dataset is not None:
+            return
+
         self.train_dataset = BrainwebDataset(
-            folder=folder,
-            size=size,
-            n_coils=n_coils,
-            noise=noise,
-            r1_stats=r1_stats,
-            r2_stats=r2_stats,
+            folder=self.folder,
+            size=self.size,
+            n_coils=self.n_coils,
+            noise=self.noise,
+            r1_stats=self.r1_stats,
+            r2_stats=self.r2_stats,
             orientation=('axial', 'coronal', 'sagittal'),
             random=True,
         )
         self.val_dataset = torch.utils.data.Subset(
             BrainwebDataset(
-                folder=folder,
-                size=size,
-                n_coils=n_coils,
-                noise=noise,
-                r1_stats=r1_stats,
-                r2_stats=r2_stats,
+                folder=self.folder,
+                size=self.size,
+                n_coils=self.n_coils,
+                noise=self.noise,
+                r1_stats=self.r1_stats,
+                r2_stats=self.r2_stats,
                 orientation=('axial',),
                 random=False,
             ),
@@ -135,6 +170,8 @@ class DataModule(pl.LightningDataModule):
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         """Return the training dataloader."""
+        if self.train_dataset is None:
+            raise RuntimeError('DataModule.setup() must be called before train_dataloader().')
         return torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -149,6 +186,8 @@ class DataModule(pl.LightningDataModule):
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
         """Return the validation dataloader."""
+        if self.val_dataset is None:
+            raise RuntimeError('DataModule.setup() must be called before val_dataloader().')
         return torch.utils.data.DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,

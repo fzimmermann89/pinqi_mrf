@@ -8,14 +8,14 @@ repos:
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.10
+    rev: v0.15.12
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix, --show-fixes]
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
+    rev: v2.0.0
     hooks:
       - id: mypy
         exclude: ^debug_.*\.py$
@@ -24,10 +24,5 @@ repos:
           - einops>=0.7.0
           - numpy>=1.24.0
           - jsonargparse[signatures]>=4.27.0
-          - h5py>=3.8.0
-          - h5py-stubs
-          - typing-extensions
-          - pytest
-          - types-PyYAML
           - --index-url=https://download.pytorch.org/whl/cpu
           - --extra-index-url=https://pypi.python.org/simple

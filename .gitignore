@@ -27,6 +27,13 @@ __pycache__/
 *.zip
 *.gz
 
+# Training artifacts
+wandb/
+logs/
+checkpoints/
+lightning_logs/
+*.ckpt
+
 # Distribution / packaging
 .Python
 build/
