@@ -40,10 +40,11 @@ class PINQI(torch.nn.Module):
         """Initialize the model."""
         super().__init__()
         self.signalmodel = signalmodel
+        self.n_parameter_priors = len(parameter_ranges) + 1
         self.parameter_net = mr2.nn.nets.UNet(
             n_dim=2,
             n_channels_in=n_subspace_coefficients * 2,
-            n_channels_out=4,
+            n_channels_out=self.n_parameter_priors + 1,
             attention_depths=(-1, -2),
             n_features=n_features_parameter_net,
             cond_dim=128,
@@ -58,8 +59,7 @@ class PINQI(torch.nn.Module):
         )
         self.parameter_net = torch.compile(self.parameter_net)
         self.image_net = torch.compile(self.image_net)
-        lambdas_raw = torch.ones(n_iterations, 3)
-        lambdas_raw[:, 2] = 0.0
+        lambdas_raw = torch.ones(n_iterations, 2 + self.n_parameter_priors)
         self.lambdas_raw = torch.nn.Parameter(lambdas_raw)
         self.softplus = torch.nn.Softplus(beta=5)
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
@@ -68,14 +68,15 @@ class PINQI(torch.nn.Module):
             index_of_scaling_parameter=0,
             batch_size=nonlinear_solver_batch_size,
         )
-        nonlinear_solver_grid = [
+        nonlinear_solver_grids = [
             torch.linspace(minimum, maximum, n_steps) for minimum, maximum, n_steps in parameter_ranges
         ]
-        self.nonlinear_solver.append(
-            torch.tensor(1.0 + 0j),
-            nonlinear_solver_grid[0][:, None],
-            nonlinear_solver_grid[1][None, :],
-        )
+        broadcasted_grids = []
+        for parameter_idx, grid in enumerate(nonlinear_solver_grids):
+            grid_shape = [1] * len(nonlinear_solver_grids)
+            grid_shape[parameter_idx] = grid.numel()
+            broadcasted_grids.append(grid.reshape(grid_shape))
+        self.nonlinear_solver.append(torch.tensor(1.0 + 0j), *broadcasted_grids)
 
     def get_linear_solver(self, normal_op: mr2.operators.LinearOperator) -> mr2.operators.ConjugateGradientOp:
         """Create the image update solver."""
@@ -98,7 +99,7 @@ class PINQI(torch.nn.Module):
 
         return mr2.operators.ConjugateGradientOp(operator_factory=operator_factory, rhs_factory=rhs_factory)
 
-    def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> tuple[torch.Tensor, ...]:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
             torch.view_as_real(image),
@@ -109,7 +110,7 @@ class PINQI(torch.nn.Module):
             parameters = self.parameter_net(image_real.contiguous(), cond=cond)
         parameters = parameters.float()
         parameters = einops.rearrange(parameters, 'batch parameters y x -> parameters batch 1 1 y x')
-        return torch.complex(parameters[0], parameters[1]), parameters[2], parameters[3]
+        return (torch.complex(parameters[0], parameters[1]), *parameters[2:].unbind())
 
     def get_image_reg(self, image: torch.Tensor, iteration: int) -> torch.Tensor:
         """Predict image-space prior from the current image estimate."""
@@ -140,14 +141,16 @@ class PINQI(torch.nn.Module):
         parameters: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         linear_solver = self.get_linear_solver(normal_op)
 
-        for iteration, (lambda_image, lambda_q, lambda_parameter) in enumerate(self.softplus(self.lambdas_raw)):
+        for iteration, (lambda_image, lambda_q, *lambda_parameters) in enumerate(self.softplus(self.lambdas_raw)):
             image_reg = self.get_image_reg(images[-1], iteration)
             images.extend(linear_solver(lambda_image, lambda_q, image_reg, signal, rhs))
             parameter_reg = self.get_parameter_reg(images[-1], iteration)
+            if len(lambda_parameters) != self.n_parameter_priors:
+                raise RuntimeError('Number of parameter prior weights must match the parameter prior tuple.')
             parameter, signal = self.nonlinear_solver(
                 images[-1].swapaxes(0, 1),
                 prior=parameter_reg,
-                prior_precision=lambda_parameter,
+                prior_precision=tuple(lambda_parameters),
                 return_signal=True,
             )
             signal = signal.swapaxes(0, 1)
@@ -171,14 +174,15 @@ class BaselineReconstruction(torch.nn.Module):
             index_of_scaling_parameter=0,
             batch_size=nonlinear_solver_batch_size,
         )
-        nonlinear_solver_grid = [
+        nonlinear_solver_grids = [
             torch.linspace(minimum, maximum, n_steps) for minimum, maximum, n_steps in parameter_ranges
         ]
-        self.dictionary_match.append(
-            torch.tensor(1.0 + 0j),
-            nonlinear_solver_grid[0][:, None],
-            nonlinear_solver_grid[1][None, :],
-        )
+        broadcasted_grids = []
+        for parameter_idx, grid in enumerate(nonlinear_solver_grids):
+            grid_shape = [1] * len(nonlinear_solver_grids)
+            grid_shape[parameter_idx] = grid.numel()
+            broadcasted_grids.append(grid.reshape(grid_shape))
+        self.dictionary_match.append(torch.tensor(1.0 + 0j), *broadcasted_grids)
 
     def forward(
         self,
@@ -205,7 +209,7 @@ class PinqiModule(pl.LightningModule):
         trajectory: str = 'radial',
         n_iterations: int = 4,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
-        n_features_image_net: Sequence[int] = (32, 48, 64, 96),
+        n_features_image_net: Sequence[int] = (48, 64, 96, 128),
         nonlinear_solver_batch_size: int = 8192,
         lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
@@ -363,9 +367,17 @@ class PinqiModule(pl.LightningModule):
         pred_t2 = standardized_rate_to_relaxation_time(pred_r2, R2_STATS)
         baseline_t1 = standardized_rate_to_relaxation_time(baseline_r1, R1_STATS)
         baseline_t2 = standardized_rate_to_relaxation_time(baseline_r2, R2_STATS)
+        pred_t2_raw = pred_t2
+        baseline_t2_raw = baseline_t2
         target_t1_map = target_t1.squeeze(1, 2)
         target_t2_map = target_t2.squeeze(1, 2)
         metric_mask = mask & torch.isfinite(target_t1_map) & torch.isfinite(target_t2_map)
+        target_t1 = target_t1.clamp(*T1_DISPLAY_RANGE)
+        target_t2 = target_t2.clamp(*T2_DISPLAY_RANGE)
+        pred_t1 = pred_t1.clamp(*T1_DISPLAY_RANGE)
+        pred_t2 = pred_t2.clamp(*T2_DISPLAY_RANGE)
+        baseline_t1 = baseline_t1.clamp(*T1_DISPLAY_RANGE)
+        baseline_t2 = baseline_t2.clamp(*T2_DISPLAY_RANGE)
         target_t1 = torch.where(metric_mask[:, None, None], target_t1, torch.zeros_like(target_t1))
         target_t2 = torch.where(metric_mask[:, None, None], target_t2, torch.zeros_like(target_t2))
         pred_t1 = torch.where(metric_mask[:, None, None], pred_t1, torch.zeros_like(pred_t1))
@@ -398,6 +410,7 @@ class PinqiModule(pl.LightningModule):
         target_t2_map = target_t2.squeeze(1, 2)
         baseline_t1_map = baseline_t1.squeeze(1, 2)
         baseline_t2_map = baseline_t2.squeeze(1, 2)
+        pred_r2_map = pred_r2.squeeze(1, 2)
         rmse_t1 = torch.sqrt(torch.nn.functional.mse_loss(pred_t1_map[metric_mask], target_t1_map[metric_mask]))
         rmse_t2 = torch.sqrt(torch.nn.functional.mse_loss(pred_t2_map[metric_mask], target_t2_map[metric_mask]))
         baseline_rmse_t1 = torch.sqrt(
@@ -406,6 +419,11 @@ class PinqiModule(pl.LightningModule):
         baseline_rmse_t2 = torch.sqrt(
             torch.nn.functional.mse_loss(baseline_t2_map[metric_mask], target_t2_map[metric_mask])
         )
+        pred_t2_raw_masked = pred_t2_raw.squeeze(1, 2)[metric_mask]
+        baseline_t2_raw_masked = baseline_t2_raw.squeeze(1, 2)[metric_mask]
+        target_t2_masked = target_t2_map[metric_mask]
+        pred_r2_masked = pred_r2_map[metric_mask]
+        pred_r2_rate_masked = pred_r2_masked * R2_STATS[1] + R2_STATS[0]
         self.log('val/ssim_t1', ssim_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/ssim_t2', ssim_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/rmse_t1', rmse_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
@@ -415,6 +433,25 @@ class PinqiModule(pl.LightningModule):
         self.log('val/rmse_t1_baseline', baseline_rmse_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/rmse_t2_baseline', baseline_rmse_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/loss', loss, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/debug/pred_t2_abs_max', pred_t2_raw_masked.abs().amax(), on_epoch=True, sync_dist=True)
+        self.log('val/debug/pred_t2_min', pred_t2_raw_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log('val/debug/pred_t2_p99', torch.quantile(pred_t2_raw_masked, 0.99), on_epoch=True, sync_dist=True)
+        self.log('val/debug/baseline_t2_abs_max', baseline_t2_raw_masked.abs().amax(), on_epoch=True, sync_dist=True)
+        self.log('val/debug/target_t2_abs_max', target_t2_masked.abs().amax(), on_epoch=True, sync_dist=True)
+        self.log('val/debug/pred_r2_min', pred_r2_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log('val/debug/pred_r2_rate_min', pred_r2_rate_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log(
+            'val/debug/pred_t2_invalid_fraction',
+            (~torch.isfinite(pred_t2_raw_masked)).float().mean(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            'val/debug/pred_t2_gt_display_max_fraction',
+            (pred_t2_raw_masked > T2_DISPLAY_RANGE[1]).float().mean(),
+            on_epoch=True,
+            sync_dist=True,
+        )
 
         if batch_idx == 0 and self.trainer.is_global_zero:
             self.validation_step_outputs['target_r1'] = batch['r1'][:, None, None].detach().cpu()
@@ -576,12 +613,11 @@ class LogLambdasCallback(pl.Callback):
         if trainer.global_step % 10 != 0:
             return
         lambdas = pl_module.pinqi.softplus(pl_module.pinqi.lambdas_raw).detach().cpu()
-        for iteration, (lambda_image, lambda_q, lambda_parameter) in enumerate(lambdas):
+        for iteration, iteration_lambdas in enumerate(lambdas):
             pl_module.log_dict(
                 {
-                    f'parameter/lambda_image_{iteration}': lambda_image,
-                    f'parameter/lambda_q_{iteration}': lambda_q,
-                    f'parameter/lambda_parameter_{iteration}': lambda_parameter,
+                    f'parameter/lambda_{lambda_idx}_{iteration}': value
+                    for lambda_idx, value in enumerate(iteration_lambdas)
                 },
                 on_step=True,
                 on_epoch=False,
