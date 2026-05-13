@@ -3,12 +3,14 @@
 from collections.abc import Sequence
 from typing import Any
 
+import cmap
 import einops
 import lightning.pytorch as pl
 import matplotlib.pyplot as plt
 import mr2
 import numpy as np
 import torch
+from matplotlib.colors import Colormap
 
 from pinqi_mrf.acquisition import create_radial_trajectory
 from pinqi_mrf.data import BatchType
@@ -16,9 +18,10 @@ from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxa
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
 
-MAX_SUPERVISED_R2 = 10.0
-T1_DISPLAY_RANGE = (0.0, 4.0)
-T2_DISPLAY_RANGE = (0.020, 2.0)
+MIN_SUPERVISED_T1 = 0.5
+MIN_SUPERVISED_T2 = 0.03
+T1_DISPLAY_RANGE = (0.0, 2.0)
+T2_DISPLAY_RANGE = (0.020, 0.150)
 
 
 class PINQI(torch.nn.Module):
@@ -31,8 +34,8 @@ class PINQI(torch.nn.Module):
         n_iterations: int,
         n_features_parameter_net: Sequence[int],
         n_features_image_net: Sequence[int],
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 6.5, 200)),
-        nonlinear_solver_batch_size: int = 16384,
+        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        nonlinear_solver_batch_size: int = 8192,
     ) -> None:
         """Initialize the model."""
         super().__init__()
@@ -56,7 +59,7 @@ class PINQI(torch.nn.Module):
         self.parameter_net = torch.compile(self.parameter_net)
         self.image_net = torch.compile(self.image_net)
         lambdas_raw = torch.ones(n_iterations, 3)
-        lambdas_raw[:, 2] = -1.0
+        lambdas_raw[:, 2] = 0.0
         self.lambdas_raw = torch.nn.Parameter(lambdas_raw)
         self.softplus = torch.nn.Softplus(beta=5)
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
@@ -66,8 +69,7 @@ class PINQI(torch.nn.Module):
             batch_size=nonlinear_solver_batch_size,
         )
         nonlinear_solver_grid = [
-            torch.linspace(minimum, maximum, n_steps)
-            for minimum, maximum, n_steps in parameter_ranges
+            torch.linspace(minimum, maximum, n_steps) for minimum, maximum, n_steps in parameter_ranges
         ]
         self.nonlinear_solver.append(
             torch.tensor(1.0 + 0j),
@@ -153,6 +155,41 @@ class PINQI(torch.nn.Module):
         return images, parameters
 
 
+class BaselineReconstruction(torch.nn.Module):
+    """Unregularized CG reconstruction followed by dictionary matching."""
+
+    def __init__(
+        self,
+        signalmodel: mr2.operators.SignalModel,
+        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        nonlinear_solver_batch_size: int = 8192,
+    ) -> None:
+        """Initialize the baseline reconstruction."""
+        super().__init__()
+        self.dictionary_match = mr2.operators.DictionaryMatchOp(
+            signalmodel,
+            index_of_scaling_parameter=0,
+            batch_size=nonlinear_solver_batch_size,
+        )
+        nonlinear_solver_grid = [
+            torch.linspace(minimum, maximum, n_steps) for minimum, maximum, n_steps in parameter_ranges
+        ]
+        self.dictionary_match.append(
+            torch.tensor(1.0 + 0j),
+            nonlinear_solver_grid[0][:, None],
+            nonlinear_solver_grid[1][None, :],
+        )
+
+    def forward(
+        self,
+        rhs: torch.Tensor,
+        normal_op: mr2.operators.LinearOperator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply unregularized CG and dictionary matching."""
+        images = list(mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=10))
+        return self.dictionary_match(images[-1].swapaxes(0, 1))
+
+
 class PinqiModule(pl.LightningModule):
     """Lightning module for PINQI-MRF training."""
 
@@ -160,17 +197,17 @@ class PinqiModule(pl.LightningModule):
         self,
         signalmodel: mr2.operators.SignalModel | None = None,
         n_subspace_coefficients: int = 10,
-        image_size: int = 192,
-        n_readout_samples: int = 192,
+        image_size: int = 256,
+        n_readout_samples: int = 256,
         n_coils: int = 8,
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 6.5, 200)),
+        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
         n_iterations: int = 4,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
         n_features_image_net: Sequence[int] = (32, 48, 64, 96),
-        nonlinear_solver_batch_size: int = 16384,
-        lr: float = 1.5e-4,  # noqa: ARG002
+        nonlinear_solver_batch_size: int = 8192,
+        lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
         loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
     ) -> None:
@@ -199,6 +236,11 @@ class PinqiModule(pl.LightningModule):
             n_iterations=n_iterations,
             n_features_parameter_net=n_features_parameter_net,
             n_features_image_net=n_features_image_net,
+            parameter_ranges=parameter_ranges,
+            nonlinear_solver_batch_size=nonlinear_solver_batch_size,
+        )
+        self.baseline = BaselineReconstruction(
+            signalmodel=self.signalmodel,
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
         )
@@ -264,7 +306,11 @@ class PinqiModule(pl.LightningModule):
             torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask'])
         )
         mask = mask.bool()
-        parameter_mask = mask & torch.isfinite(target_r1) & torch.isfinite(target_r2) & (target_r2 < MAX_SUPERVISED_R2)
+        target_t1 = standardized_rate_to_relaxation_time(target_r1, R1_STATS)
+        target_t2 = standardized_rate_to_relaxation_time(target_r2, R2_STATS)
+        parameter_mask = self._parameter_mask(mask, target_r1, target_r2, target_t1, target_t2)
+        log_debug = self.training and self.global_step % 10 == 0
+        final_iteration = len(predictions) - 1
         for iteration, (prediction, weight) in enumerate(zip(predictions, self.hparams.loss_weights, strict=True)):
             prediction_m0, prediction_r1, prediction_r2 = map(torch.squeeze, prediction)
             loss_r1 = torch.nn.functional.mse_loss(prediction_r1[parameter_mask], target_r1[parameter_mask])
@@ -274,22 +320,23 @@ class PinqiModule(pl.LightningModule):
                 torch.view_as_real(target_m0.to(prediction_m0.dtype)[parameter_mask]),
             )
             loss_outside = prediction_m0[~mask].abs().mean()
-            self.log_dict(
-                {
-                    f'debug/loss_r1_{iteration}': loss_r1,
-                    f'debug/loss_r2_{iteration}': loss_r2,
-                    f'debug/loss_m0_{iteration}': loss_m0,
-                    f'debug/loss_outside_{iteration}': loss_outside,
-                    f'debug/parameter_mask_fraction_{iteration}': parameter_mask.float().mean(),
-                    f'debug/target_r2_abs_max_{iteration}': target_r2[mask].detach().abs().max(),
-                    f'debug/pred_r1_abs_max_{iteration}': prediction_r1.detach().abs().max(),
-                    f'debug/pred_r2_abs_max_{iteration}': prediction_r2.detach().abs().max(),
-                    f'debug/pred_m0_abs_max_{iteration}': prediction_m0.detach().abs().max(),
-                },
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
+            if log_debug and iteration == final_iteration:
+                self.log_dict(
+                    {
+                        'debug/loss_r1': loss_r1.detach(),
+                        'debug/loss_r2': loss_r2.detach(),
+                        'debug/loss_m0': loss_m0.detach(),
+                        'debug/loss_outside': loss_outside.detach(),
+                        'debug/parameter_mask_fraction': parameter_mask.float().mean(),
+                        'debug/target_t1_min': target_t1[mask].detach().amin(),
+                        'debug/target_t2_min': target_t2[mask].detach().amin(),
+                        'debug/pred_r1_abs_max': prediction_r1.detach().abs().max(),
+                        'debug/pred_r2_abs_max': prediction_r2.detach().abs().max(),
+                    },
+                    on_step=True,
+                    on_epoch=False,
+                    rank_zero_only=True,
+                )
             loss = loss + weight * (loss_r1 + loss_r2 + 0.5 * loss_m0 + 0.1 * loss_outside)
         return loss
 
@@ -307,17 +354,73 @@ class PinqiModule(pl.LightningModule):
         _images, parameters = self(rhs, normal_op)
         loss = self.loss(parameters, batch)
         _pred_m0, pred_r1, pred_r2 = parameters[-1]
-        mask = batch['mask']
+        _baseline_m0, baseline_r1, baseline_r2 = self.baseline(rhs, normal_op)
+        mask = batch['mask'].bool()
         batch_size = len(mask)
-        (ssim_r1,) = mr2.operators.functionals.SSIM(batch['r1'][:, None, None], mask)(pred_r1)
-        (ssim_r2,) = mr2.operators.functionals.SSIM(batch['r2'][:, None, None], mask)(pred_r2)
-        self.log('val/ssim_r1', ssim_r1, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log('val/ssim_r2', ssim_r2, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        target_t1 = standardized_rate_to_relaxation_time(batch['r1'][:, None, None], R1_STATS)
+        target_t2 = standardized_rate_to_relaxation_time(batch['r2'][:, None, None], R2_STATS)
+        pred_t1 = standardized_rate_to_relaxation_time(pred_r1, R1_STATS)
+        pred_t2 = standardized_rate_to_relaxation_time(pred_r2, R2_STATS)
+        baseline_t1 = standardized_rate_to_relaxation_time(baseline_r1, R1_STATS)
+        baseline_t2 = standardized_rate_to_relaxation_time(baseline_r2, R2_STATS)
+        target_t1_map = target_t1.squeeze(1, 2)
+        target_t2_map = target_t2.squeeze(1, 2)
+        metric_mask = mask & torch.isfinite(target_t1_map) & torch.isfinite(target_t2_map)
+        target_t1 = torch.where(metric_mask[:, None, None], target_t1, torch.zeros_like(target_t1))
+        target_t2 = torch.where(metric_mask[:, None, None], target_t2, torch.zeros_like(target_t2))
+        pred_t1 = torch.where(metric_mask[:, None, None], pred_t1, torch.zeros_like(pred_t1))
+        pred_t2 = torch.where(metric_mask[:, None, None], pred_t2, torch.zeros_like(pred_t2))
+        baseline_t1 = torch.where(metric_mask[:, None, None], baseline_t1, torch.zeros_like(baseline_t1))
+        baseline_t2 = torch.where(metric_mask[:, None, None], baseline_t2, torch.zeros_like(baseline_t2))
+        (ssim_t1,) = mr2.operators.functionals.SSIM(
+            target_t1,
+            metric_mask,
+            data_range=torch.tensor(T1_DISPLAY_RANGE[1] - T1_DISPLAY_RANGE[0], device=self.device),
+        )(pred_t1)
+        (ssim_t2,) = mr2.operators.functionals.SSIM(
+            target_t2,
+            metric_mask,
+            data_range=torch.tensor(T2_DISPLAY_RANGE[1] - T2_DISPLAY_RANGE[0], device=self.device),
+        )(pred_t2)
+        (baseline_ssim_t1,) = mr2.operators.functionals.SSIM(
+            target_t1,
+            metric_mask,
+            data_range=torch.tensor(T1_DISPLAY_RANGE[1] - T1_DISPLAY_RANGE[0], device=self.device),
+        )(baseline_t1)
+        (baseline_ssim_t2,) = mr2.operators.functionals.SSIM(
+            target_t2,
+            metric_mask,
+            data_range=torch.tensor(T2_DISPLAY_RANGE[1] - T2_DISPLAY_RANGE[0], device=self.device),
+        )(baseline_t2)
+        pred_t1_map = pred_t1.squeeze(1, 2)
+        pred_t2_map = pred_t2.squeeze(1, 2)
+        target_t1_map = target_t1.squeeze(1, 2)
+        target_t2_map = target_t2.squeeze(1, 2)
+        baseline_t1_map = baseline_t1.squeeze(1, 2)
+        baseline_t2_map = baseline_t2.squeeze(1, 2)
+        rmse_t1 = torch.sqrt(torch.nn.functional.mse_loss(pred_t1_map[metric_mask], target_t1_map[metric_mask]))
+        rmse_t2 = torch.sqrt(torch.nn.functional.mse_loss(pred_t2_map[metric_mask], target_t2_map[metric_mask]))
+        baseline_rmse_t1 = torch.sqrt(
+            torch.nn.functional.mse_loss(baseline_t1_map[metric_mask], target_t1_map[metric_mask])
+        )
+        baseline_rmse_t2 = torch.sqrt(
+            torch.nn.functional.mse_loss(baseline_t2_map[metric_mask], target_t2_map[metric_mask])
+        )
+        self.log('val/ssim_t1', ssim_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/ssim_t2', ssim_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/rmse_t1', rmse_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/rmse_t2', rmse_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/ssim_t1_baseline', baseline_ssim_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/ssim_t2_baseline', baseline_ssim_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/rmse_t1_baseline', baseline_rmse_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log('val/rmse_t2_baseline', baseline_rmse_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/loss', loss, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
         if batch_idx == 0 and self.trainer.is_global_zero:
             self.validation_step_outputs['target_r1'] = batch['r1'][:, None, None].detach().cpu()
             self.validation_step_outputs['target_r2'] = batch['r2'][:, None, None].detach().cpu()
+            self.validation_step_outputs['baseline_r1'] = baseline_r1.detach().cpu()
+            self.validation_step_outputs['baseline_r2'] = baseline_r2.detach().cpu()
             self.validation_step_outputs['pred_r1'] = pred_r1.detach().cpu()
             self.validation_step_outputs['pred_r2'] = pred_r2.detach().cpu()
             self.validation_step_outputs['mask'] = mask.detach().cpu()
@@ -327,9 +430,32 @@ class PinqiModule(pl.LightningModule):
         if not self.trainer.is_global_zero or not self.validation_step_outputs:
             return
 
-        self._log_relaxation_time_figure('t1', 'r1', R1_STATS, '$T_1$ [s]', T1_DISPLAY_RANGE)
-        self._log_relaxation_time_figure('t2', 'r2', R2_STATS, '$T_2$ [s]', T2_DISPLAY_RANGE)
+        self._log_relaxation_time_figure(
+            't1', 'r1', R1_STATS, '$T_1$ [s]', T1_DISPLAY_RANGE, cmap.Colormap('lipari').to_mpl()
+        )
+        self._log_relaxation_time_figure(
+            't2', 'r2', R2_STATS, '$T_2$ [s]', T2_DISPLAY_RANGE, cmap.Colormap('navia').to_mpl()
+        )
         self.validation_step_outputs.clear()
+
+    @staticmethod
+    def _parameter_mask(
+        mask: torch.Tensor,
+        target_r1: torch.Tensor,
+        target_r2: torch.Tensor,
+        target_t1: torch.Tensor,
+        target_t2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the mask used for supervised parameter metrics."""
+        return (
+            mask
+            & torch.isfinite(target_r1)
+            & torch.isfinite(target_r2)
+            & torch.isfinite(target_t1)
+            & torch.isfinite(target_t2)
+            & (target_t1 >= MIN_SUPERVISED_T1)
+            & (target_t2 >= MIN_SUPERVISED_T2)
+        )
 
     def _log_relaxation_time_figure(
         self,
@@ -338,22 +464,24 @@ class PinqiModule(pl.LightningModule):
         stats: tuple[float, float],
         label: str,
         value_range: tuple[float, float],
+        colormap: Colormap,
     ) -> None:
         """Log one parameter figure to W&B."""
         outputs = self.validation_step_outputs
         samples = len(outputs['mask'])
         vmin, vmax = value_range
-        fig, axes = plt.subplots(3, samples, figsize=(4 * samples, 12), squeeze=False)
+        fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
         for sample in range(samples):
             self.result_plot(
                 standardized_rate_to_relaxation_time(outputs[f'target_{rate_name}'][sample], stats),
+                standardized_rate_to_relaxation_time(outputs[f'baseline_{rate_name}'][sample], stats),
                 standardized_rate_to_relaxation_time(outputs[f'pred_{rate_name}'][sample], stats),
                 outputs['mask'][sample],
                 axes[:, sample],
                 label,
                 vmin=vmin,
                 vmax=vmax,
-                cmap='viridis',
+                cmap=colormap,
             )
         fig.suptitle(f'{label} Epoch {self.current_epoch}')
         self.logger.experiment.log({f'val/images/{relaxation_name}': fig})
@@ -362,19 +490,22 @@ class PinqiModule(pl.LightningModule):
     @staticmethod
     def result_plot(
         target: torch.Tensor,
+        baseline: torch.Tensor,
         pred: torch.Tensor,
         mask: torch.Tensor,
         axes: Sequence[plt.Axes] | np.ndarray,
         label: str,
         vmax: float | None = None,
         vmin: float = 0.0,
-        cmap: str = 'viridis',
+        cmap: str | Colormap = 'viridis',
     ) -> None:
         """Plot target, prediction, and error."""
         target = target.squeeze().cpu()
+        baseline = baseline.squeeze().detach().cpu()
         pred = pred.squeeze().detach().cpu()
         mask = mask.squeeze().detach().bool().cpu()
         target[~mask] = torch.nan
+        baseline[~mask] = torch.nan
         pred[~mask] = torch.nan
         difference = target - pred
         if vmax is None:
@@ -385,16 +516,21 @@ class PinqiModule(pl.LightningModule):
         axes[0].axis('off')
         plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label=label)
 
-        im1 = axes[1].imshow(pred, vmin=vmin, vmax=vmax, cmap=cmap)
-        axes[1].set_title('PINQI')
+        im1 = axes[1].imshow(baseline, vmin=vmin, vmax=vmax, cmap=cmap)
+        axes[1].set_title('Baseline')
         axes[1].axis('off')
         plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label=label)
 
-        diff_vmax = np.nanpercentile(difference.abs().numpy(), 90)
-        im2 = axes[2].imshow(difference, cmap='coolwarm', vmin=-diff_vmax, vmax=diff_vmax)
-        axes[2].set_title('Error')
+        im2 = axes[2].imshow(pred, vmin=vmin, vmax=vmax, cmap=cmap)
+        axes[2].set_title('PINQI')
         axes[2].axis('off')
-        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label=label)
+
+        diff_vmax = np.nanpercentile(difference.abs().numpy(), 90)
+        im3 = axes[3].imshow(difference, cmap='coolwarm', vmin=-diff_vmax, vmax=diff_vmax)
+        axes[3].set_title('PINQI Error')
+        axes[3].axis('off')
+        plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning-rate scheduler."""

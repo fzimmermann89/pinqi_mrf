@@ -4,7 +4,9 @@ JOB_NAME="pinqi-training"
 
 HOST="$(hostname -s)"
 export TRITON_CACHE_DIR=/dev/shm/${USER}/${JOB_NAME}-triton
+export TORCHINDUCTOR_CACHE_DIR="/dev/shm/${USER}/${JOB_NAME}-torchinductor"
 mkdir -p "${TRITON_CACHE_DIR}"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
 mkdir -p logs
 
@@ -34,4 +36,4 @@ export NCCL_SOCKET_IFNAME=en
 ulimit -n 16384
 
 echo "Starting training..."
-"${PYTHON}" -u -m pinqi_mrf.cli fit --run_name "${JOB_NAME}" "$@"
+"${PYTHON}" -u -m pinqi_mrf.cli fit "$@"

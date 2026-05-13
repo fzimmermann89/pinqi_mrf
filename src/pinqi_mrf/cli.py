@@ -2,7 +2,9 @@
 
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -37,7 +39,13 @@ class PinqiLightningCLI(LightningCLI):
             default=Path('checkpoints'),
             help='Base checkpoint directory.',
         )
-        parser.add_argument('--run_name', type=str, required=True, help='W&B run name and checkpoint directory name.')
+        parser.add_argument('--run_name', type=str, default=None, help='Optional W&B run name.')
+        parser.add_argument(
+            '--checkpoint_name',
+            type=str,
+            default=None,
+            help='Checkpoint directory name. Defaults to a generated run id.',
+        )
 
     def before_instantiate_classes(self) -> None:
         """Configure logging and checkpointing before Trainer instantiation."""
@@ -45,16 +53,21 @@ class PinqiLightningCLI(LightningCLI):
             return
 
         config = getattr(self.config, self.subcommand)
-        run_dir = Path(config.checkpoint_dir) / config.run_name
+        run_id = datetime.now(UTC).strftime('%Y%m%d-%H%M%S')
+        checkpoint_name = config.checkpoint_name or config.run_name or run_id
+        run_dir = Path(config.checkpoint_dir) / checkpoint_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
         config.trainer.default_root_dir = str(run_dir)
-        config.trainer.logger = WandbLogger(
-            name=config.run_name,
-            project=config.project,
-            log_model=False,
-            save_dir='logs',
-        )
+        logger_kwargs: dict[str, Any] = {
+            'id': run_id,
+            'project': config.project,
+            'log_model': False,
+            'save_dir': 'logs',
+        }
+        if config.run_name is not None:
+            logger_kwargs['name'] = config.run_name
+        config.trainer.logger = WandbLogger(**logger_kwargs)
         config.trainer.callbacks = [
             LearningRateMonitor(logging_interval='step'),
             ModelCheckpoint(

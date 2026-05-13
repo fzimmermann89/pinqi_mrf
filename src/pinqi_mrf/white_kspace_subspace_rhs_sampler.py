@@ -41,6 +41,9 @@ class WhiteKspaceSubspaceRhsNoiseSampler(mr2.utils.TensorAttributeMixin):
         super().__init__()
 
         kernel = subspace_gram_op._kernel
+        if kernel is None:
+            raise ValueError('Subspace Gram operator does not have a cached Toeplitz kernel.')
+
         self._subspace_dim = subspace_gram_op._subspace_dim
         self._dim = tuple(subspace_gram_op._dim)
         self._recon_shape = tuple(subspace_gram_op._recon_shape)
@@ -49,10 +52,12 @@ class WhiteKspaceSubspaceRhsNoiseSampler(mr2.utils.TensorAttributeMixin):
 
         spectral_matrix = kernel.movedim((0, 1), (-2, -1))
         spectral_matrix = 0.5 * (spectral_matrix + spectral_matrix.mH)
+        spectral_matrix = spectral_matrix.cpu()
         eigenvalues, eigenvectors = torch.linalg.eigh(spectral_matrix)
-        diagonal_scale = kernel.diagonal(dim1=0, dim2=1).real.mean().clamp_min(1e-12)
+        diagonal_scale = spectral_matrix.diagonal(dim1=-2, dim2=-1).real.mean().clamp_min(1e-12)
         eigenvalue_floor = 1e-6 * diagonal_scale
-        self._psd_factor = eigenvectors * eigenvalues.clamp_min(eigenvalue_floor).sqrt().unsqueeze(-2)
+        psd_factor = eigenvectors * eigenvalues.clamp_min(eigenvalue_floor).sqrt().unsqueeze(-2)
+        self._psd_factor = psd_factor.to(kernel.device)
 
     def __call__(self, stddev: float | torch.Tensor) -> torch.Tensor:
         """Sample coilwise additive rhs noise.

@@ -42,7 +42,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         folder: Path,
-        size: int = 192,
+        size: int = 256,
         n_coils: int = 8,
         noise: tuple[float, float] = (0.0, 0.1),
         r1_stats: tuple[float, float] = R1_STATS,
@@ -110,13 +110,13 @@ class DataModule(pl.LightningDataModule):
     def __init__(
         self,
         folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
-        size: int = 192,
+        size: int = 256,
         n_coils: int = 8,
         noise: tuple[float, float] = (0.0, 0.1),
         r1_stats: tuple[float, float] = R1_STATS,
         r2_stats: tuple[float, float] = R2_STATS,
-        batch_size: int = 8,
-        num_workers: int = 8,
+        batch_size: int = 6,
+        num_workers: int = 4,
     ) -> None:
         """Initialize the data module."""
         super().__init__()

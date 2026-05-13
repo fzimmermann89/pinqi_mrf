@@ -20,7 +20,7 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         signalmodel: mr2.operators.SignalModel,
         n_subspace_coefficients: int,
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 6.5, 200)),
+        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
     ) -> None:
         """Initialize the subspace-compressed lookup model.
 
