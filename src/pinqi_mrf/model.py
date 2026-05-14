@@ -294,6 +294,7 @@ class PinqiModule(pl.LightningModule):
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
         n_iterations: int = 4,
+        use_ground_truth_csm: bool = False,
         csm_refinement_iterations: tuple[int, ...] = (),
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
@@ -319,6 +320,7 @@ class PinqiModule(pl.LightningModule):
         self.n_compressed_coils = n_compressed_coils or n_coils
         if self.n_compressed_coils > self.n_coils:
             raise ValueError('n_compressed_coils must not exceed n_coils.')
+        self.use_ground_truth_csm = use_ground_truth_csm
         self.matrix_size = mr2.data.SpatialDimension(1, image_size, image_size)
         match trajectory:
             case 'radial':
@@ -377,7 +379,7 @@ class PinqiModule(pl.LightningModule):
             n_coils=self.n_coils,
         )
 
-    def simulate_coil_rhs(self, batch: BatchType) -> torch.Tensor:
+    def simulate_coil_rhs(self, batch: BatchType) -> tuple[torch.Tensor, torch.Tensor]:
         """Simulate compressed coilwise subspace RHS data from synthetic maps."""
         if self.subspace_gram is None or self.noise_sampler is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
@@ -388,22 +390,28 @@ class PinqiModule(pl.LightningModule):
         (coil_coefficients,) = csm_op(coefficients)
         (coil_rhs,) = self.subspace_gram(coil_coefficients)
         coil_rhs = coil_rhs + self.noise_sampler(batch['noise_std'])
-        return self.compress_coils(coil_rhs)
+        return self.compress_coils(coil_rhs, batch['csm'])
 
-    def compress_coils(self, coil_rhs: torch.Tensor) -> torch.Tensor:
+    def compress_coils(self, coil_rhs: torch.Tensor, csm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compress the coil dimension using an SVD of the coilwise RHS."""
         n_coils = coil_rhs.shape[2]
         if self.n_compressed_coils >= n_coils:
-            return coil_rhs
+            return coil_rhs, csm
 
         data = einops.rearrange(coil_rhs, 'batch coeff coil z y x -> batch coil (coeff z y x)')
         u, _, _ = torch.linalg.svd(data, full_matrices=False)
         compression = u[:, :, : self.n_compressed_coils].mH
-        return einops.einsum(
+        coil_rhs_compressed = einops.einsum(
             compression,
             coil_rhs,
             'batch compressed_coil coil, batch coeff coil z y x -> batch coeff compressed_coil z y x',
         )
+        csm_compressed = einops.einsum(
+            compression,
+            csm,
+            'batch compressed_coil coil, batch coil z y x -> batch compressed_coil z y x',
+        )
+        return coil_rhs_compressed, csm_compressed
 
     @staticmethod
     def estimate_initial_csm(coil_rhs: torch.Tensor) -> torch.Tensor:
@@ -475,16 +483,17 @@ class PinqiModule(pl.LightningModule):
 
     def training_step(self, batch: BatchType, _batch_idx: int) -> torch.Tensor:
         """Run one training step."""
-        coil_rhs = self.simulate_coil_rhs(batch)
-        _images, parameters = self(coil_rhs)
+        coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
+        csm_initial = csm_ground_truth if self.use_ground_truth_csm else None
+        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
         loss = self.loss(parameters, batch)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: BatchType, batch_idx: int) -> None:
         """Run one validation step."""
-        coil_rhs = self.simulate_coil_rhs(batch)
-        csm_initial = self.estimate_initial_csm(coil_rhs)
+        coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
+        csm_initial = csm_ground_truth if self.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)

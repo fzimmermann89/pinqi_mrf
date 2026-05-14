@@ -99,7 +99,7 @@ def main() -> None:
 
     print('\nGenerating compressed coilwise RHS...')
     with torch.no_grad():
-        coil_rhs = model.simulate_coil_rhs(batch)
+        coil_rhs, _csm_ground_truth = model.simulate_coil_rhs(batch)
     print(f'coil_rhs: shape={tuple(coil_rhs.shape)}, dtype={coil_rhs.dtype}, norm={coil_rhs.norm().item():.6g}')
 
     print('\nEstimating initial CSMs with rank-1 calibration + Inati...')
@@ -119,7 +119,7 @@ def main() -> None:
     rhs, normal_op = model.pinqi.get_normal_equations(coil_rhs, csm_initial, model.subspace_gram)
     print(f'rhs: shape={tuple(rhs.shape)}, dtype={rhs.dtype}, norm={rhs.norm().item():.6g}')
     with torch.no_grad():
-        alpha_initial, = mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=args.initial_cg_iterations)
+        (alpha_initial,) = mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=args.initial_cg_iterations)
     residual_initial = relative_residual(normal_op, alpha_initial, rhs)
     print(f'alpha_initial: shape={tuple(alpha_initial.shape)}, norm={alpha_initial.norm().item():.6g}')
     print(f'initial relative residual: {residual_initial.item():.6g}')
@@ -136,13 +136,13 @@ def main() -> None:
         subspace_gram=model.subspace_gram,
         regularization_weight=args.csm_weight,
     )
-    csm_low, = csm_refinement_solver(
+    (csm_low,) = csm_refinement_solver(
         alpha_initial,
         coil_rhs,
         csm_low_initial,
         initial_value=(csm_low_initial,),
     )
-    csm_refined, = downsampling.H(csm_low)
+    (csm_refined,) = downsampling.H(csm_low)
     csm_refined = csm_refined / csm_refined.abs().square().sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
     alignment = (csm_refined * csm_initial.conj()).sum(dim=1, keepdim=True)
     phase = alignment / alignment.abs().clamp_min(1e-8)
@@ -160,7 +160,7 @@ def main() -> None:
     print('\nSolving coefficient images with refined CSMs...')
     rhs_refined, normal_op_refined = model.pinqi.get_normal_equations(coil_rhs, csm_refined, model.subspace_gram)
     with torch.no_grad():
-        alpha_refined, = mr2.algorithms.optimizers.cg(
+        (alpha_refined,) = mr2.algorithms.optimizers.cg(
             normal_op_refined,
             rhs_refined,
             max_iterations=args.initial_cg_iterations,

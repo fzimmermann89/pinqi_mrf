@@ -9,7 +9,7 @@ from pinqi_mrf.model import PINQI
 def test_csm_refinement_solver_matches_manual_expression() -> None:
     """The low-resolution CSM refinement solver uses the expected normal equations."""
     torch.manual_seed(0)
-    alpha = torch.randn(2, 3, 1, 4, 5, dtype=torch.complex64)
+    alpha = torch.randn(2, 3, 1, 1, 4, 5, dtype=torch.complex64)
     csm_low = torch.randn(2, 4, 1, 2, 3, dtype=torch.complex64)
     coil_rhs = torch.randn(2, 3, 4, 1, 4, 5, dtype=torch.complex64)
     downsampling = mr2.operators.DownSamplingOp(
@@ -26,7 +26,13 @@ def test_csm_refinement_solver_matches_manual_expression() -> None:
         regularization_weight=regularization_weight,
     )
 
-    coil_lift = mr2.operators.EinsumOp(alpha, 'b t z y x, b c z y x -> b t c z y x') @ downsampling.H
+    coil_lift = (
+        mr2.operators.EinsumOp(
+            alpha,
+            'batch coeff one z y x, batch coil z y x -> batch coeff coil z y x',
+        )
+        @ downsampling.H
+    )
     operator = coil_lift.H @ mr2.operators.IdentityOp() @ coil_lift + regularization_weight
     (expected_operator_result,) = operator(csm_low)
     (expected_rhs,) = coil_lift.H(coil_rhs)
