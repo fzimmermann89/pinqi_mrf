@@ -39,6 +39,9 @@ class PINQI(torch.nn.Module):
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
+        initial_cg_iterations: int = 5,
+        image_cg_iterations: int = 20,
+        image_cg_tolerance: float = 1e-5,
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         nonlinear_solver_batch_size: int = 8192,
     ) -> None:
@@ -52,6 +55,9 @@ class PINQI(torch.nn.Module):
         self.csm_refinement_shape = csm_refinement_shape
         self.csm_refinement_weight = csm_refinement_weight
         self.csm_refinement_cg_iterations = csm_refinement_cg_iterations
+        self.initial_cg_iterations = initial_cg_iterations
+        self.image_cg_iterations = image_cg_iterations
+        self.image_cg_tolerance = image_cg_tolerance
         self.parameter_net = mr2.nn.nets.UNet(
             n_dim=2,
             n_channels_in=n_subspace_coefficients * 2,
@@ -108,7 +114,12 @@ class PINQI(torch.nn.Module):
         ) -> tuple[torch.Tensor]:
             return (rhs + lambda_image * image_reg + lambda_q * signal,)
 
-        return mr2.operators.ConjugateGradientOp(operator_factory=operator_factory, rhs_factory=rhs_factory)
+        return mr2.operators.ConjugateGradientOp(
+            operator_factory=operator_factory,
+            rhs_factory=rhs_factory,
+            max_iterations=self.image_cg_iterations,
+            tolerance=self.image_cg_tolerance,
+        )
 
     def get_csm_refinement_solver(
         self,
@@ -200,7 +211,7 @@ class PINQI(torch.nn.Module):
     ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply the unrolled PINQI reconstruction."""
         rhs, normal_op = self.get_normal_equations(coil_rhs, csm_initial, subspace_gram)
-        images = list(mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=2))
+        images = list(mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=self.initial_cg_iterations))
         signal = images[-1]
         parameters: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         linear_solver = self.get_linear_solver(normal_op)
@@ -295,10 +306,15 @@ class PinqiModule(pl.LightningModule):
         trajectory: str = 'radial',
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,
+        csm_estimation_iterations: int = 2,
+        csm_estimation_smoothing_width: int = 11,
         csm_refinement_iterations: tuple[int, ...] = (),
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
+        initial_cg_iterations: int = 5,
+        image_cg_iterations: int = 20,
+        image_cg_tolerance: float = 1e-5,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
         n_features_image_net: Sequence[int] = (48, 64, 96, 128),
         nonlinear_solver_batch_size: int = 8192,
@@ -321,6 +337,8 @@ class PinqiModule(pl.LightningModule):
         if self.n_compressed_coils > self.n_coils:
             raise ValueError('n_compressed_coils must not exceed n_coils.')
         self.use_ground_truth_csm = use_ground_truth_csm
+        self.csm_estimation_iterations = csm_estimation_iterations
+        self.csm_estimation_smoothing_width = csm_estimation_smoothing_width
         self.matrix_size = mr2.data.SpatialDimension(1, image_size, image_size)
         match trajectory:
             case 'radial':
@@ -340,6 +358,9 @@ class PinqiModule(pl.LightningModule):
             csm_refinement_shape=csm_refinement_shape,
             csm_refinement_weight=csm_refinement_weight,
             csm_refinement_cg_iterations=csm_refinement_cg_iterations,
+            initial_cg_iterations=initial_cg_iterations,
+            image_cg_iterations=image_cg_iterations,
+            image_cg_tolerance=image_cg_tolerance,
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
         )
@@ -413,8 +434,7 @@ class PinqiModule(pl.LightningModule):
         )
         return coil_rhs_compressed, csm_compressed
 
-    @staticmethod
-    def estimate_initial_csm(coil_rhs: torch.Tensor) -> torch.Tensor:
+    def estimate_initial_csm(self, coil_rhs: torch.Tensor) -> torch.Tensor:
         """Estimate initial CSMs from the dominant subspace coefficient combination."""
         with torch.no_grad():
             data = einops.rearrange(coil_rhs, 'batch coeff coil z y x -> batch coeff (coil z y x)')
@@ -423,7 +443,13 @@ class PinqiModule(pl.LightningModule):
             calibration = einops.einsum(
                 eigenvectors[..., -1].conj(), coil_rhs, 'batch coeff, batch coeff coil z y x -> batch coil z y x'
             )
-        return mr2.algorithms.csm.inati(calibration, smoothing_width=11)
+            csm = mr2.algorithms.csm.inati(
+                calibration,
+                smoothing_width=self.csm_estimation_smoothing_width,
+                n_iterations=self.csm_estimation_iterations,
+            )
+            csm = torch.where(torch.isfinite(csm), csm, 0.0)
+        return csm
 
     def forward(
         self,
