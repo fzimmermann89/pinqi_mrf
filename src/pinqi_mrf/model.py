@@ -40,6 +40,7 @@ class PINQI(torch.nn.Module):
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
         initial_cg_iterations: int = 5,
+        initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
         image_cg_tolerance: float = 1e-5,
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
@@ -56,6 +57,7 @@ class PINQI(torch.nn.Module):
         self.csm_refinement_weight = csm_refinement_weight
         self.csm_refinement_cg_iterations = csm_refinement_cg_iterations
         self.initial_cg_iterations = initial_cg_iterations
+        self.initial_cg_regularization = initial_cg_regularization
         self.image_cg_iterations = image_cg_iterations
         self.image_cg_tolerance = image_cg_tolerance
         self.parameter_net = mr2.nn.nets.UNet(
@@ -211,7 +213,13 @@ class PINQI(torch.nn.Module):
     ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply the unrolled PINQI reconstruction."""
         rhs, normal_op = self.get_normal_equations(coil_rhs, csm_initial, subspace_gram)
-        images = list(mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=self.initial_cg_iterations))
+        images = list(
+            mr2.algorithms.optimizers.cg(
+                normal_op + self.initial_cg_regularization,
+                rhs,
+                max_iterations=self.initial_cg_iterations,
+            )
+        )
         signal = images[-1]
         parameters: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         linear_solver = self.get_linear_solver(normal_op)
@@ -308,11 +316,13 @@ class PinqiModule(pl.LightningModule):
         use_ground_truth_csm: bool = False,
         csm_estimation_iterations: int = 2,
         csm_estimation_smoothing_width: int = 11,
+        csm_extrapolate: bool = True,
         csm_refinement_iterations: tuple[int, ...] = (),
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
         initial_cg_iterations: int = 5,
+        initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
         image_cg_tolerance: float = 1e-5,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
@@ -339,6 +349,7 @@ class PinqiModule(pl.LightningModule):
         self.use_ground_truth_csm = use_ground_truth_csm
         self.csm_estimation_iterations = csm_estimation_iterations
         self.csm_estimation_smoothing_width = csm_estimation_smoothing_width
+        self.csm_extrapolate = csm_extrapolate
         self.matrix_size = mr2.data.SpatialDimension(1, image_size, image_size)
         match trajectory:
             case 'radial':
@@ -359,6 +370,7 @@ class PinqiModule(pl.LightningModule):
             csm_refinement_weight=csm_refinement_weight,
             csm_refinement_cg_iterations=csm_refinement_cg_iterations,
             initial_cg_iterations=initial_cg_iterations,
+            initial_cg_regularization=initial_cg_regularization,
             image_cg_iterations=image_cg_iterations,
             image_cg_tolerance=image_cg_tolerance,
             parameter_ranges=parameter_ranges,
@@ -447,6 +459,7 @@ class PinqiModule(pl.LightningModule):
                 calibration,
                 smoothing_width=self.csm_estimation_smoothing_width,
                 n_iterations=self.csm_estimation_iterations,
+                extrapolate=self.csm_extrapolate,
             )
             csm = torch.where(torch.isfinite(csm), csm, 0.0)
         return csm
@@ -510,7 +523,9 @@ class PinqiModule(pl.LightningModule):
     def training_step(self, batch: BatchType, _batch_idx: int) -> torch.Tensor:
         """Run one training step."""
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
-        csm_initial = csm_ground_truth if self.use_ground_truth_csm else None
+        csm_initial = csm_ground_truth if self.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
+        if self.global_step % 10 == 0:
+            self.log_csm_diagnostics(csm_initial, prefix='debug/train_csm')
         _images, parameters = self(coil_rhs, csm_initial=csm_initial)
         loss = self.loss(parameters, batch)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -520,6 +535,8 @@ class PinqiModule(pl.LightningModule):
         """Run one validation step."""
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
         csm_initial = csm_ground_truth if self.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
+        if batch_idx == 0:
+            self.log_csm_diagnostics(csm_initial, prefix='debug/val_csm')
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
@@ -629,6 +646,22 @@ class PinqiModule(pl.LightningModule):
             self.validation_step_outputs['pred_r1'] = pred_r1.detach().cpu()
             self.validation_step_outputs['pred_r2'] = pred_r2.detach().cpu()
             self.validation_step_outputs['mask'] = mask.detach().cpu()
+
+    def log_csm_diagnostics(self, csm: torch.Tensor, prefix: str) -> None:
+        """Log coil-wise CSM normalization diagnostics."""
+        norm = csm.abs().square().sum(dim=1).sqrt()
+        self.log_dict(
+            {
+                f'{prefix}_norm_min': norm.detach().amin(),
+                f'{prefix}_norm_mean': norm.detach().mean(),
+                f'{prefix}_norm_max': norm.detach().amax(),
+                f'{prefix}_low_norm_fraction': (norm < 1e-3).float().mean(),
+                f'{prefix}_finite_fraction': torch.isfinite(csm).float().mean(),
+            },
+            on_step=self.training,
+            on_epoch=not self.training,
+            sync_dist=True,
+        )
 
     def on_validation_epoch_end(self) -> None:
         """Log validation images."""
