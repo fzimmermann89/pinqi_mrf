@@ -29,6 +29,7 @@ def test_subspace_lookup_shape_and_scaling() -> None:
         n_subspace_coefficients=2,
         parameter_stats=((1.0, 0.5), (5.0, 2.0)),
         parameter_ranges=((-0.5, 0.5, 4), (-0.5, 0.5, 5)),
+        n_timepoints=2,
     )
 
     m0 = torch.tensor([[1.0 + 2.0j, 0.5 - 0.25j]])
@@ -38,6 +39,7 @@ def test_subspace_lookup_shape_and_scaling() -> None:
     (result,) = signalmodel(m0, p1, p2)
     (unit_scale_result,) = signalmodel(torch.ones_like(m0), p1, p2)
 
+    assert signalmodel.n_timepoints == 2
     assert result.shape == (2, *m0.shape)
     assert result.is_complex()
     torch.testing.assert_close(result, m0.unsqueeze(0) * unit_scale_result)

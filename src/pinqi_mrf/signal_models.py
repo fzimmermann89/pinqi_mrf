@@ -21,6 +21,7 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         n_subspace_coefficients: int,
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        n_timepoints: int | None = None,
     ) -> None:
         """Initialize the subspace-compressed lookup model.
 
@@ -35,6 +36,9 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
             Mean and standard deviation for each standardized relaxation-rate coordinate.
         parameter_ranges
             Standardized LUT support ranges as ``(minimum, maximum, n_steps)`` for each parameter.
+        n_timepoints
+            Number of leading time points to retain from the signal model. If
+            ``None``, all time points are used.
         """
         super().__init__()
         if len(parameter_ranges) != len(parameter_stats):
@@ -56,6 +60,8 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
             mesh = torch.meshgrid(*axes, indexing='ij')
             with torch.inference_mode():
                 (signal,) = simulate_unit_scale(*mesh)
+            if n_timepoints is not None:
+                signal = signal[:n_timepoints]
             dictionary = einops.rearrange(signal, 'time ... -> (...) time')
             return mr2.operators.PCACompressionOp(dictionary, n_subspace_coefficients, centering=False)
 
@@ -65,6 +71,8 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         def simulate_unit_scale_subspace(*parameters: torch.Tensor) -> tuple[torch.Tensor]:
             with torch.inference_mode():
                 (signal,) = simulate_unit_scale(*parameters)
+            if n_timepoints is not None:
+                signal = signal[:n_timepoints]
             batch_shape = signal.shape[1:]
             signal = einops.rearrange(signal, 'time ... -> (...) time')
             (coefficients,) = self.pca(signal)

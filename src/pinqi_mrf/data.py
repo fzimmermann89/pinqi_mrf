@@ -96,9 +96,9 @@ class BrainwebDataset(torch.utils.data.Dataset):
                 self.n_coils,
                 self.matrix_size,
                 relative_radius=rng.float32(1.2, 1.8),
-            )
+            ).squeeze(0)
             if self.n_coils > 1
-            else torch.ones(1, 1, *self.matrix_size.zyx, dtype=torch.complex64),
+            else torch.ones(1, *self.matrix_size.zyx, dtype=torch.complex64),
             'mask': phantom['mask'],
             'noise_std': torch.tensor(rng.float32(*self.noise)),
         }

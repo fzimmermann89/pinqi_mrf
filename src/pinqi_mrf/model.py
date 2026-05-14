@@ -1,7 +1,7 @@
 """PINQI-MRF model skeleton."""
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import cmap
 import einops
@@ -11,6 +11,7 @@ import mr2
 import numpy as np
 import torch
 from matplotlib.colors import Colormap
+from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
 from pinqi_mrf.acquisition import create_radial_trajectory
 from pinqi_mrf.data import BatchType
@@ -34,6 +35,10 @@ class PINQI(torch.nn.Module):
         n_iterations: int,
         n_features_parameter_net: Sequence[int],
         n_features_image_net: Sequence[int],
+        csm_refinement_iterations: tuple[int, ...] = (),
+        csm_refinement_shape: tuple[int, int] = (64, 64),
+        csm_refinement_weight: float = 1e-2,
+        csm_refinement_cg_iterations: int = 10,
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         nonlinear_solver_batch_size: int = 8192,
     ) -> None:
@@ -41,6 +46,12 @@ class PINQI(torch.nn.Module):
         super().__init__()
         self.signalmodel = signalmodel
         self.n_parameter_priors = len(parameter_ranges) + 1
+        if any(iteration < 0 or iteration >= n_iterations for iteration in csm_refinement_iterations):
+            raise ValueError('csm_refinement_iterations must be between 0 and n_iterations - 1.')
+        self.csm_refinement_iterations = tuple(dict.fromkeys(csm_refinement_iterations))
+        self.csm_refinement_shape = csm_refinement_shape
+        self.csm_refinement_weight = csm_refinement_weight
+        self.csm_refinement_cg_iterations = csm_refinement_cg_iterations
         self.parameter_net = mr2.nn.nets.UNet(
             n_dim=2,
             n_channels_in=n_subspace_coefficients * 2,
@@ -99,6 +110,57 @@ class PINQI(torch.nn.Module):
 
         return mr2.operators.ConjugateGradientOp(operator_factory=operator_factory, rhs_factory=rhs_factory)
 
+    def get_csm_refinement_solver(
+        self,
+        downsampling: mr2.operators.LinearOperator,
+        subspace_gram: mr2.operators.LinearOperator,
+        regularization_weight: float | torch.Tensor,
+    ) -> mr2.operators.ConjugateGradientOp:
+        """Create the low-resolution CSM refinement solver."""
+
+        def operator_factory(alpha: torch.Tensor, *_: torch.Tensor) -> mr2.operators.LinearOperator:
+            coil_lift = (
+                mr2.operators.EinsumOp(
+                    alpha,
+                    'batch coeff one z y x, batch coil z y x -> batch coeff coil z y x',
+                )
+                @ downsampling.H
+            )
+            return coil_lift.H @ subspace_gram @ coil_lift + regularization_weight
+
+        def rhs_factory(
+            alpha: torch.Tensor,
+            coil_rhs: torch.Tensor,
+            csm_low_initial: torch.Tensor,
+        ) -> tuple[torch.Tensor]:
+            coil_lift = (
+                mr2.operators.EinsumOp(
+                    alpha,
+                    'batch coeff one z y x, batch coil z y x -> batch coeff coil z y x',
+                )
+                @ downsampling.H
+            )
+            (rhs,) = coil_lift.H(coil_rhs)
+            return (rhs + regularization_weight * csm_low_initial,)
+
+        return mr2.operators.ConjugateGradientOp(
+            operator_factory=operator_factory,
+            rhs_factory=rhs_factory,
+            max_iterations=self.csm_refinement_cg_iterations,
+        )
+
+    @staticmethod
+    def get_normal_equations(
+        coil_rhs: torch.Tensor,
+        csm: torch.Tensor,
+        subspace_gram: mr2.operators.LinearOperator,
+    ) -> tuple[torch.Tensor, mr2.operators.LinearOperator]:
+        """Create normal equations for a given CSM estimate."""
+        csm_op = mr2.operators.SensitivityOp(csm[:, None])
+        normal_op = csm_op.H @ subspace_gram @ csm_op
+        (rhs,) = csm_op.H(coil_rhs)
+        return rhs, normal_op
+
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> tuple[torch.Tensor, ...]:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
@@ -132,14 +194,25 @@ class PINQI(torch.nn.Module):
 
     def forward(
         self,
-        rhs: torch.Tensor,
-        normal_op: mr2.operators.LinearOperator,
+        coil_rhs: torch.Tensor,
+        csm_initial: torch.Tensor,
+        subspace_gram: mr2.operators.LinearOperator,
     ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply the unrolled PINQI reconstruction."""
+        rhs, normal_op = self.get_normal_equations(coil_rhs, csm_initial, subspace_gram)
         images = list(mr2.algorithms.optimizers.cg(normal_op, rhs, max_iterations=2))
         signal = images[-1]
         parameters: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         linear_solver = self.get_linear_solver(normal_op)
+
+        if self.csm_refinement_iterations:
+            downsampling = mr2.operators.DownSamplingOp(
+                dim=(-2, -1), domain_shape=tuple(csm_initial.shape[-2:]), range_shape=self.csm_refinement_shape
+            )
+            (csm_low_initial,) = downsampling(csm_initial)
+            csm_refinement_solver = self.get_csm_refinement_solver(
+                downsampling=downsampling, subspace_gram=subspace_gram, regularization_weight=self.csm_refinement_weight
+            )
 
         for iteration, (lambda_image, lambda_q, *lambda_parameters) in enumerate(self.softplus(self.lambdas_raw)):
             image_reg = self.get_image_reg(images[-1], iteration)
@@ -155,6 +228,17 @@ class PINQI(torch.nn.Module):
             )
             signal = signal.swapaxes(0, 1)
             parameters.append(parameter)
+            if iteration in self.csm_refinement_iterations:
+                (csm_low,) = csm_refinement_solver(
+                    images[-1], coil_rhs, csm_low_initial, initial_value=(csm_low_initial,)
+                )
+                (csm_refined,) = downsampling.H(csm_low)
+                csm_refined = csm_refined / csm_refined.abs().square().sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
+                alignment = (csm_refined * csm_initial.conj()).sum(dim=1, keepdim=True)
+                phase = alignment / alignment.abs().clamp_min(1e-8)
+                csm_refined = csm_refined * phase.conj()
+                rhs, normal_op = self.get_normal_equations(coil_rhs, csm_refined, subspace_gram)
+                linear_solver = self.get_linear_solver(normal_op)
         return images, parameters
 
 
@@ -204,10 +288,16 @@ class PinqiModule(pl.LightningModule):
         image_size: int = 256,
         n_readout_samples: int = 256,
         n_coils: int = 8,
+        n_compressed_coils: int | None = None,
+        n_timepoints: int | None = None,
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
         n_iterations: int = 4,
+        csm_refinement_iterations: tuple[int, ...] = (),
+        csm_refinement_shape: tuple[int, int] = (64, 64),
+        csm_refinement_weight: float = 1e-2,
+        csm_refinement_cg_iterations: int = 10,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
         n_features_image_net: Sequence[int] = (48, 64, 96, 128),
         nonlinear_solver_batch_size: int = 8192,
@@ -223,8 +313,12 @@ class PinqiModule(pl.LightningModule):
             n_subspace_coefficients=n_subspace_coefficients,
             parameter_stats=parameter_stats,
             parameter_ranges=parameter_ranges,
+            n_timepoints=n_timepoints,
         )
         self.n_coils = n_coils
+        self.n_compressed_coils = n_compressed_coils or n_coils
+        if self.n_compressed_coils > self.n_coils:
+            raise ValueError('n_compressed_coils must not exceed n_coils.')
         self.matrix_size = mr2.data.SpatialDimension(1, image_size, image_size)
         match trajectory:
             case 'radial':
@@ -240,6 +334,10 @@ class PinqiModule(pl.LightningModule):
             n_iterations=n_iterations,
             n_features_parameter_net=n_features_parameter_net,
             n_features_image_net=n_features_image_net,
+            csm_refinement_iterations=csm_refinement_iterations,
+            csm_refinement_shape=csm_refinement_shape,
+            csm_refinement_weight=csm_refinement_weight,
+            csm_refinement_cg_iterations=csm_refinement_cg_iterations,
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
         )
@@ -249,7 +347,7 @@ class PinqiModule(pl.LightningModule):
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
         )
         self.validation_step_outputs: dict[str, torch.Tensor] = {}
-        self.subspace_gram: mr2.operators.LinearOperator | None = None
+        self.subspace_gram: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.noise_sampler: WhiteKspaceSubspaceRhsNoiseSampler | None = None
 
     def on_fit_start(self) -> None:
@@ -270,34 +368,65 @@ class PinqiModule(pl.LightningModule):
             encoding_matrix=self.matrix_size,
             traj=self.traj.to(self.device),
         )
-        self.subspace_gram = nufft_op.toeplitz(subspace=self.signalmodel.pca, subspace_dim=1)
+        self.subspace_gram = cast(
+            SubspaceNonUniformFastFourierOpGramOp,
+            nufft_op.toeplitz(subspace=self.signalmodel.pca, subspace_dim=1),
+        )
         self.noise_sampler = WhiteKspaceSubspaceRhsNoiseSampler(
             self.subspace_gram,
             n_coils=self.n_coils,
         )
 
-    def prepare_normal_equations(self, batch: BatchType) -> tuple[torch.Tensor, mr2.operators.LinearOperator]:
-        """Create batch-specific normal equations from parameter maps and CSMs."""
+    def simulate_coil_rhs(self, batch: BatchType) -> torch.Tensor:
+        """Simulate compressed coilwise subspace RHS data from synthetic maps."""
         if self.subspace_gram is None or self.noise_sampler is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
 
         (coefficients,) = self.signalmodel(batch['m0'], batch['r1'], batch['r2'])
         coefficients = einops.rearrange(coefficients, 'coeff batch y x -> batch coeff 1 1 y x')
-        csm_op = mr2.operators.SensitivityOp(batch['csm'])
-        normal_op = csm_op.H @ self.subspace_gram @ csm_op
+        csm_op = mr2.operators.SensitivityOp(batch['csm'][:, None])
         (coil_coefficients,) = csm_op(coefficients)
-        (rhs_coilwise,) = self.subspace_gram(coil_coefficients)
-        rhs_coilwise = rhs_coilwise + self.noise_sampler(batch['noise_std'])
-        (rhs,) = csm_op.H(rhs_coilwise)
-        return rhs, normal_op
+        (coil_rhs,) = self.subspace_gram(coil_coefficients)
+        coil_rhs = coil_rhs + self.noise_sampler(batch['noise_std'])
+        return self.compress_coils(coil_rhs)
+
+    def compress_coils(self, coil_rhs: torch.Tensor) -> torch.Tensor:
+        """Compress the coil dimension using an SVD of the coilwise RHS."""
+        n_coils = coil_rhs.shape[2]
+        if self.n_compressed_coils >= n_coils:
+            return coil_rhs
+
+        data = einops.rearrange(coil_rhs, 'batch coeff coil z y x -> batch coil (coeff z y x)')
+        u, _, _ = torch.linalg.svd(data, full_matrices=False)
+        compression = u[:, :, : self.n_compressed_coils].mH
+        return einops.einsum(
+            compression,
+            coil_rhs,
+            'batch compressed_coil coil, batch coeff coil z y x -> batch coeff compressed_coil z y x',
+        )
+
+    @staticmethod
+    def estimate_initial_csm(coil_rhs: torch.Tensor) -> torch.Tensor:
+        """Estimate initial CSMs from the dominant subspace coefficient combination."""
+        with torch.no_grad():
+            data = einops.rearrange(coil_rhs, 'batch coeff coil z y x -> batch coeff (coil z y x)')
+            covariance = data @ data.mH
+            _, eigenvectors = torch.linalg.eigh(covariance)
+            calibration = einops.einsum(
+                eigenvectors[..., -1].conj(), coil_rhs, 'batch coeff, batch coeff coil z y x -> batch coil z y x'
+            )
+        return mr2.algorithms.csm.inati(calibration, smoothing_width=11)
 
     def forward(
         self,
-        rhs: torch.Tensor,
-        normal_op: mr2.operators.LinearOperator,
+        coil_rhs: torch.Tensor,
+        csm_initial: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply the PINQI model."""
-        return self.pinqi(rhs, normal_op)
+        if self.subspace_gram is None:
+            raise RuntimeError('Acquisition operators have not been initialized.')
+        csm_initial = csm_initial if csm_initial is not None else self.estimate_initial_csm(coil_rhs)
+        return self.pinqi(coil_rhs, csm_initial, self.subspace_gram)
 
     def loss(
         self,
@@ -346,16 +475,20 @@ class PinqiModule(pl.LightningModule):
 
     def training_step(self, batch: BatchType, _batch_idx: int) -> torch.Tensor:
         """Run one training step."""
-        rhs, normal_op = self.prepare_normal_equations(batch)
-        _images, parameters = self(rhs, normal_op)
+        coil_rhs = self.simulate_coil_rhs(batch)
+        _images, parameters = self(coil_rhs)
         loss = self.loss(parameters, batch)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: BatchType, batch_idx: int) -> None:
         """Run one validation step."""
-        rhs, normal_op = self.prepare_normal_equations(batch)
-        _images, parameters = self(rhs, normal_op)
+        coil_rhs = self.simulate_coil_rhs(batch)
+        csm_initial = self.estimate_initial_csm(coil_rhs)
+        if self.subspace_gram is None:
+            raise RuntimeError('Acquisition operators have not been initialized.')
+        rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
+        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
         loss = self.loss(parameters, batch)
         _pred_m0, pred_r1, pred_r2 = parameters[-1]
         _baseline_m0, baseline_r1, baseline_r2 = self.baseline(rhs, normal_op)
