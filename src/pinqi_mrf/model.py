@@ -696,11 +696,11 @@ class PinqiModule(pl.LightningModule):
         axes[2].axis('off')
         plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label=label)
 
-        diff_vmax = np.nanpercentile(difference.abs().numpy(), 90)
+        diff_vmax = 0.1 * vmax
         im3 = axes[3].imshow(difference, cmap='coolwarm', vmin=-diff_vmax, vmax=diff_vmax)
         axes[3].set_title('PINQI Error')
         axes[3].axis('off')
-        plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+        plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$ [s]')
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning-rate scheduler."""
