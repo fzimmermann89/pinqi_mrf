@@ -291,7 +291,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
         if tmp_path.exists():
             tmp_path.unlink()
 
-        trajectory, dcf_tensor = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
+        trajectory, dcf = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
         traj = trajectory.to(device)
         matrix = mr2.data.SpatialDimension(1, size_y, size_x)
         nufft = mr2.operators.NonUniformFastFourierOp(
@@ -300,7 +300,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
             encoding_matrix=matrix,
             traj=traj,
         )
-        dcf = dcf_tensor.numpy()
+        dcf_numpy = dcf.data.numpy()
         dictionary_match = create_dictionary_matcher(device, batch_size=config.dictionary_batch_size)
 
         with h5py.File(tmp_path, 'w') as target, torch.inference_mode():
@@ -317,7 +317,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
                 size_x=size_x,
                 n_readout_samples=n_readout_samples,
             )
-            write_trajectory_and_dcf(target, traj=traj.cpu(), dcf=dcf)
+            write_trajectory_and_dcf(target, traj=traj.cpu(), dcf=dcf_numpy)
 
             for z in tqdm(
                 range(n_slices),
