@@ -2,7 +2,7 @@
 
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +58,7 @@ class PinqiLightningCLI(LightningCLI):
             return
 
         config = getattr(self.config, self.subcommand)
-        run_id = datetime.now(UTC).strftime('%Y%m%d-%H%M%S')
+        run_id = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
         checkpoint_name = config.checkpoint_name or config.run_name or run_id
         run_dir = Path(config.checkpoint_dir) / checkpoint_name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -82,6 +82,7 @@ class PinqiLightningCLI(LightningCLI):
                 dirpath=str(run_dir),
                 filename='{epoch:02d}-{val/loss:.4f}',
                 save_last=True,
+                save_on_train_epoch_end=False,
             ),
             LogLambdasCallback(),
         ]

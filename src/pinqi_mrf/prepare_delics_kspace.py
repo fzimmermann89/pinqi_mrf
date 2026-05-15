@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +14,7 @@ import mr2
 import numpy as np
 import scipy.ndimage as ndimage
 import torch
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 
@@ -30,20 +30,9 @@ class ConversionConfig:
     output_root: Path
     case_glob: str = 'reconstructions_rovir_case*.h5'
     n_readout_samples: int | None = None
-    device: str = 'auto'
     chunk_slices: int = 1
     overwrite: bool = False
     skip_csm: bool = False
-
-
-def resolve_device(device: str) -> torch.device:
-    """Resolve CLI device string."""
-    if device == 'auto':
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    requested = torch.device(device)
-    if requested.type == 'cuda' and not torch.cuda.is_available():
-        raise RuntimeError('CUDA was requested, but torch.cuda.is_available() is False.')
-    return requested
 
 
 def create_radial_dcf(n_timepoints: int, n_readout_samples: int) -> np.ndarray:
@@ -91,7 +80,7 @@ def estimate_csm(frames: torch.Tensor) -> tuple[np.ndarray, bool]:
     energy = frames.abs().square().sum(dim=(1, 2, 3)).sqrt()
     if not torch.isfinite(energy).all() or energy.sum() <= 0:
         csm = torch.zeros(frames.shape[1], 1, *frames.shape[-2:], dtype=torch.complex64)
-        csm[0] = 1.0 + 0.0j
+        csm[0] = torch.ones_like(csm[0])
         return csm.cpu().numpy().astype(np.complex64), False
 
     weights = energy / energy.sum().clamp_min(1e-12)
@@ -289,7 +278,7 @@ def convert_all(config: ConversionConfig) -> list[Path]:
     os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
     if config.chunk_slices < 1:
         raise ValueError('chunk_slices must be at least 1.')
-    device = resolve_device(config.device)
+    device = torch.device('cuda')
     config.output_root.mkdir(parents=True, exist_ok=True)
     source_files = find_source_files(config.input_root, config.case_glob)
     if not source_files:
@@ -307,14 +296,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--case-glob', type=str, default='reconstructions_rovir_case*.h5')
     parser.add_argument('--n-readout-samples', type=int, default=None)
-    parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--chunk-slices', type=int, default=1)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--skip-csm', action='store_true')
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Run DELICS k-space conversion."""
     args = build_parser().parse_args(argv)
     config = ConversionConfig(
@@ -322,7 +310,6 @@ def main(argv: Iterable[str] | None = None) -> None:
         output_root=args.output_root,
         case_glob=args.case_glob,
         n_readout_samples=args.n_readout_samples,
-        device=args.device,
         chunk_slices=args.chunk_slices,
         overwrite=args.overwrite,
         skip_csm=args.skip_csm,

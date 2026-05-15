@@ -515,13 +515,14 @@ class PinqiModule(pl.LightningModule):
             # The first parameter is the pure scaling parameter M0; detail losses act on quantitative parameters.
             prediction_parameters = predictions[-1][1:]
             if self.hparams.loss_l1:
-                components['l1'] = sum(
+                losses_l1 = (
                     torch.nn.functional.l1_loss(
                         prediction.squeeze(1, 2)[parameter_mask],
                         target.squeeze(1, 2)[parameter_mask],
                     )
                     for prediction, target in zip(prediction_parameters, target_parameters, strict=True)
                 )
+                components['l1'] = sum(losses_l1, start=torch.tensor(0.0, device=self.device))
             if self.hparams.loss_ssim:
                 components['ssim'] = ssim_loss(
                     prediction_parameters,
