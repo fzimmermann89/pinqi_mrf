@@ -1,5 +1,7 @@
 """Tests for acquisition helpers."""
 
+import torch
+
 from pinqi_mrf.acquisition import create_radial_trajectory
 
 
@@ -13,4 +15,7 @@ def test_create_radial_trajectory() -> None:
     assert trajectory.shape == (n_spokes, 1, 1, 1, n_readout_samples)
     assert trajectory.kx.shape == (n_spokes, 1, 1, 1, n_readout_samples)
     assert trajectory.ky.shape == (n_spokes, 1, 1, 1, n_readout_samples)
-    assert dcf.shape[-1] == n_readout_samples
+    assert dcf.data.shape == (1, 1, 1, 1, n_readout_samples)
+    assert torch.isfinite(dcf.data).all()
+    assert (dcf.data >= 0).all()
+    torch.testing.assert_close(dcf.data.mean(), torch.tensor(1.0))
