@@ -20,6 +20,10 @@ from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 
 SOURCE_DELICS_SCRIPT = '/home/zimmer08/thesis/delics.py'
 SCHEMA_VERSION = 1
+N_COMPRESSED_COILS = 8
+DEFAULT_INPUT_ROOT = Path('/scratch/zimmer08/delics')
+DEFAULT_OUTPUT_FOLDER = 'radial_kspace'
+DEFAULT_DICTIONARY_BATCH_SIZE = 8192
 
 
 @dataclass(frozen=True)
@@ -30,9 +34,8 @@ class ConversionConfig:
     output_root: Path
     case_glob: str = 'reconstructions_rovir_case*.h5'
     n_readout_samples: int | None = None
-    chunk_slices: int = 1
     overwrite: bool = False
-    skip_csm: bool = False
+    dictionary_batch_size: int = DEFAULT_DICTIONARY_BATCH_SIZE
 
 
 def create_radial_dcf(n_timepoints: int, n_readout_samples: int) -> np.ndarray:
@@ -87,7 +90,7 @@ def estimate_csm(frames: torch.Tensor) -> tuple[np.ndarray, bool]:
     calibration = (frames * weights[:, None, None, None]).sum(dim=0)
     csm_ok = True
     try:
-        csm = mr2.algorithms.csm.inati(calibration[None, :, None], smoothing_width=31).squeeze(0)
+        csm = mr2.algorithms.csm.inati(calibration[None, :, None], smoothing_width=31, extrapolate=True).squeeze(0)
     except Exception:  # noqa: BLE001
         csm = calibration[:, None]
         csm_ok = False
@@ -96,6 +99,60 @@ def estimate_csm(frames: torch.Tensor) -> tuple[np.ndarray, bool]:
     csm = csm / norm
     csm = torch.where(torch.isfinite(csm), csm, torch.zeros_like(csm))
     return csm.cpu().numpy().astype(np.complex64), csm_ok
+
+
+def compress_coils(
+    frames: torch.Tensor,
+    n_compressed_coils: int = N_COMPRESSED_COILS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compress one slice to a fixed number of virtual coils."""
+    n_source_coils = frames.shape[1]
+    if n_source_coils < n_compressed_coils:
+        raise ValueError(f'Cannot compress {n_source_coils} source coils to {n_compressed_coils} coils.')
+    data = frames.movedim(1, 0).flatten(1)
+    covariance = data @ data.conj().mT
+    _, eigenvectors = torch.linalg.eigh(covariance)
+    compression = eigenvectors[:, -n_compressed_coils:].mH
+    compressed = torch.einsum('oc,tczyx->tozyx', compression, frames)
+    return compressed.contiguous(), compression.contiguous()
+
+
+def create_dictionary_matcher(
+    device: torch.device,
+    *,
+    batch_size: int = DEFAULT_DICTIONARY_BATCH_SIZE,
+) -> mr2.operators.DictionaryMatchOp:
+    """Create full-frame NeuroMRF dictionary matcher for reference maps."""
+    signal = mr2.operators.models.NeuroMRF().to(device)
+
+    def signal_without_b1(m0: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor]:
+        return signal(m0, t1, t2)
+
+    dictionary_match = mr2.operators.DictionaryMatchOp(
+        signal_without_b1,
+        index_of_scaling_parameter=0,
+        batch_size=batch_size,
+    )
+    t1 = torch.linspace(0.2, 4.0, 100, device=device)[:, None]
+    t2 = torch.linspace(0.01, 0.3, 100, device=device)[None, :]
+    dictionary_match.append(torch.tensor(1.0 + 0.0j, device=device), t1, t2)
+    return dictionary_match
+
+
+def dictionary_match_reference(
+    frames: torch.Tensor,
+    csm: np.ndarray,
+    dictionary_match: mr2.operators.DictionaryMatchOp,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dictionary-match coil-combined full-frame references."""
+    csm_tensor = torch.as_tensor(csm, dtype=frames.dtype, device=frames.device)
+    combined = (frames.squeeze(2) * csm_tensor[:, 0].conj()).sum(dim=1)
+    m0, t1, t2 = dictionary_match(combined.detach())
+    return (
+        m0.cpu().numpy().astype(np.complex64),
+        t1.cpu().numpy().astype(np.float32),
+        t2.cpu().numpy().astype(np.float32),
+    )
 
 
 def source_case_id(path: Path, source: h5py.File) -> str:
@@ -137,10 +194,10 @@ def create_output_file(
     n_slices: int,
     n_timepoints: int,
     n_coils: int,
+    n_source_coils: int,
     size_y: int,
     size_x: int,
     n_readout_samples: int,
-    skip_csm: bool,
 ) -> None:
     """Create output datasets and metadata."""
     target.create_dataset(
@@ -158,34 +215,50 @@ def create_output_file(
         compression='lzf',
     )
     target.create_dataset('valid', shape=(n_slices,), dtype=np.bool_)
-    if not skip_csm:
-        target.create_dataset(
-            'csm_initial',
-            shape=(n_slices, n_coils, 1, size_y, size_x),
-            dtype=np.complex64,
-            chunks=(1, n_coils, 1, size_y, size_x),
-            compression='lzf',
-        )
-        target.create_dataset('csm_valid', shape=(n_slices,), dtype=np.bool_)
+    target.create_dataset(
+        'csm_initial',
+        shape=(n_slices, n_coils, 1, size_y, size_x),
+        dtype=np.complex64,
+        chunks=(1, n_coils, 1, size_y, size_x),
+        compression='lzf',
+    )
+    target.create_dataset('csm_valid', shape=(n_slices,), dtype=np.bool_)
 
     target.attrs['case'] = case
     target.attrs['source_file'] = str(source_file)
-    target.attrs['source_delics_script'] = SOURCE_DELICS_SCRIPT
     target.attrs['n_slices'] = n_slices
     target.attrs['n_timepoints'] = n_timepoints
     target.attrs['n_coils'] = n_coils
+    target.attrs['n_source_coils'] = n_source_coils
     target.attrs['image_size_y'] = size_y
     target.attrs['image_size_x'] = size_x
     target.attrs['n_readout_samples'] = n_readout_samples
     target.attrs['trajectory'] = 'golden_angle_radial_2d'
     target.attrs['radial_golden_angle'] = RADIAL_GOLDEN_ANGLE
     target.attrs['created_by'] = 'pinqi_mrf.prepare_delics_kspace'
-    target.attrs['schema_version'] = SCHEMA_VERSION
     copy_source_attrs(source, target)
 
-    if 'coil_compression' in source:
-        source_group = target.create_group('source')
-        source_group.create_dataset('coil_compression', data=source['coil_compression'][()], dtype=np.complex64)
+    target.create_dataset(
+        'reference_m0',
+        shape=(n_slices, size_y, size_x),
+        dtype=np.complex64,
+        chunks=(1, size_y, size_x),
+        compression='lzf',
+    )
+    target.create_dataset(
+        'reference_t1',
+        shape=(n_slices, size_y, size_x),
+        dtype=np.float32,
+        chunks=(1, size_y, size_x),
+        compression='lzf',
+    )
+    target.create_dataset(
+        'reference_t2',
+        shape=(n_slices, size_y, size_x),
+        dtype=np.float32,
+        chunks=(1, size_y, size_x),
+        compression='lzf',
+    )
 
 
 def write_trajectory_and_dcf(
@@ -205,7 +278,11 @@ def write_trajectory_and_dcf(
 def convert_file(source_path: Path, output_root: Path, *, config: ConversionConfig, device: torch.device) -> Path:
     """Convert one DELICS reconstruction H5 into pseudo-acquired radial k-space."""
     with h5py.File(source_path, 'r') as source:
-        n_slices, n_timepoints, n_coils, size_y, size_x = validate_source(source, source_path)
+        n_slices, n_timepoints, n_source_coils, size_y, size_x = validate_source(source, source_path)
+        if n_source_coils < N_COMPRESSED_COILS:
+            raise ValueError(
+                f'{source_path} has {n_source_coils} coils, but {N_COMPRESSED_COILS} compressed coils were requested.'
+            )
         case = source_case_id(source_path, source)
         n_readout_samples = config.n_readout_samples or size_x
         output_path = output_root / f'delics_radial_{case}.h5'
@@ -224,6 +301,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
             traj=traj,
         )
         dcf = create_radial_dcf(n_timepoints, n_readout_samples)
+        dictionary_match = create_dictionary_matcher(device, batch_size=config.dictionary_batch_size)
 
         with h5py.File(tmp_path, 'w') as target, torch.inference_mode():
             create_output_file(
@@ -233,33 +311,41 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
                 source=source,
                 n_slices=n_slices,
                 n_timepoints=n_timepoints,
-                n_coils=n_coils,
+                n_coils=N_COMPRESSED_COILS,
+                n_source_coils=n_source_coils,
                 size_y=size_y,
                 size_x=size_x,
                 n_readout_samples=n_readout_samples,
-                skip_csm=config.skip_csm,
             )
             write_trajectory_and_dcf(target, traj=traj.cpu(), dcf=dcf)
 
-            for start in tqdm(range(0, n_slices, config.chunk_slices), desc=f'Converting {case}', leave=False):
-                stop = min(start + config.chunk_slices, n_slices)
-                for z in range(start, stop):
-                    frames = torch.as_tensor(source['slices'][z], dtype=torch.complex64, device=device)
-                    if frames.shape != (n_timepoints, n_coils, 1, size_y, size_x):
-                        raise ValueError(f'{source_path} /slices[{z}] has unexpected shape: {tuple(frames.shape)}.')
-                    frames_2d = frames.squeeze(2)
-                    mask, mask_valid = create_mask(frames_2d)
-                    (kspace,) = nufft(frames)
-                    expected_shape = (n_timepoints, n_coils, 1, 1, n_readout_samples)
-                    if kspace.shape != expected_shape:
-                        raise RuntimeError(f'NUFFT returned shape {tuple(kspace.shape)}, expected {expected_shape}.')
-                    target['kspace'][z] = kspace.cpu().numpy().astype(np.complex64)
-                    target['mask'][z] = mask
-                    target['valid'][z] = mask_valid and bool(torch.isfinite(frames).all().item())
-                    if not config.skip_csm:
-                        csm, csm_valid = estimate_csm(frames_2d)
-                        target['csm_initial'][z] = csm
-                        target['csm_valid'][z] = csm_valid
+            for z in tqdm(
+                range(n_slices),
+                desc=f'{case} slices',
+                unit='slice',
+                leave=False,
+                position=1,
+            ):
+                frames = torch.as_tensor(source['slices'][z], dtype=torch.complex64, device=device)
+                if frames.shape != (n_timepoints, n_source_coils, 1, size_y, size_x):
+                    raise ValueError(f'{source_path} /slices[{z}] has unexpected shape: {tuple(frames.shape)}.')
+                frames, _compression = compress_coils(frames)
+                frames_2d = frames.squeeze(2)
+                mask, mask_valid = create_mask(frames_2d)
+                (kspace,) = nufft(frames)
+                expected_shape = (n_timepoints, N_COMPRESSED_COILS, 1, 1, n_readout_samples)
+                if kspace.shape != expected_shape:
+                    raise RuntimeError(f'NUFFT returned shape {tuple(kspace.shape)}, expected {expected_shape}.')
+                target['kspace'][z] = kspace.cpu().numpy().astype(np.complex64)
+                target['mask'][z] = mask
+                target['valid'][z] = mask_valid and bool(torch.isfinite(frames).all().item())
+                csm, csm_valid = estimate_csm(frames_2d)
+                target['csm_initial'][z] = csm
+                target['csm_valid'][z] = csm_valid
+                reference_m0, reference_t1, reference_t2 = dictionary_match_reference(frames, csm, dictionary_match)
+                target['reference_m0'][z] = reference_m0
+                target['reference_t1'][z] = reference_t1
+                target['reference_t2'][z] = reference_t2
 
         tmp_path.replace(output_path)
         return output_path
@@ -276,15 +362,15 @@ def convert_all(config: ConversionConfig) -> list[Path]:
     os.environ.setdefault('OMP_NUM_THREADS', '1')
     os.environ.setdefault('MKL_NUM_THREADS', '1')
     os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
-    if config.chunk_slices < 1:
-        raise ValueError('chunk_slices must be at least 1.')
     device = torch.device('cuda')
     config.output_root.mkdir(parents=True, exist_ok=True)
     source_files = find_source_files(config.input_root, config.case_glob)
     if not source_files:
         raise FileNotFoundError(f'No files matching {config.case_glob!r} found in {config.input_root}.')
     outputs = []
-    for source_path in tqdm(source_files, desc='DELICS files'):
+    progress = tqdm(source_files, desc='DELICS files', unit='file', position=0)
+    for source_path in progress:
+        progress.set_postfix_str(source_path.name)
         outputs.append(convert_file(source_path, config.output_root, config=config, device=device))
     return outputs
 
@@ -292,27 +378,26 @@ def convert_all(config: ConversionConfig) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input-root', type=Path, required=True)
-    parser.add_argument('--output-root', type=Path, required=True)
+    parser.add_argument('--input-root', type=Path, default=DEFAULT_INPUT_ROOT)
+    parser.add_argument('--output-root', type=Path, default=None)
     parser.add_argument('--case-glob', type=str, default='reconstructions_rovir_case*.h5')
     parser.add_argument('--n-readout-samples', type=int, default=None)
-    parser.add_argument('--chunk-slices', type=int, default=1)
     parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--skip-csm', action='store_true')
+    parser.add_argument('--dictionary-batch-size', type=int, default=DEFAULT_DICTIONARY_BATCH_SIZE)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Run DELICS k-space conversion."""
     args = build_parser().parse_args(argv)
+    output_root = args.output_root or args.input_root / DEFAULT_OUTPUT_FOLDER
     config = ConversionConfig(
         input_root=args.input_root,
-        output_root=args.output_root,
+        output_root=output_root,
         case_glob=args.case_glob,
         n_readout_samples=args.n_readout_samples,
-        chunk_slices=args.chunk_slices,
         overwrite=args.overwrite,
-        skip_csm=args.skip_csm,
+        dictionary_batch_size=args.dictionary_batch_size,
     )
     outputs = convert_all(config)
     for output in outputs:
