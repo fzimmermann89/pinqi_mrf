@@ -24,7 +24,10 @@ from pinqi_mrf.data import DataModule
 from pinqi_mrf.model import LogLambdasCallback, PinqiModule
 
 matplotlib.use('Agg')
-torch.set_num_threads(1)
+torch.set_num_threads(4)
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 class PinqiLightningCLI(LightningCLI):
@@ -91,7 +94,6 @@ def main() -> None:
     elif len(sys.argv) > 1 and sys.argv[1].startswith('-'):
         sys.argv.insert(1, 'fit')
 
-    torch.set_float32_matmul_precision('high')
     PinqiLightningCLI(
         PinqiModule,
         DataModule,
