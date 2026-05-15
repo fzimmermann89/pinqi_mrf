@@ -14,7 +14,7 @@ import mr2
 import numpy as np
 import scipy.ndimage as ndimage
 import torch
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 

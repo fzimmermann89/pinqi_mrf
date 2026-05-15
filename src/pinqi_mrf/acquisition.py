@@ -23,7 +23,7 @@ def create_radial_trajectory(
     if n_readout_samples > 1:
         nonzero = radial[radial > 0]
         radial[center] = nonzero.min() if nonzero.numel() else 1.0
-    radial /= radial.mean()
+    radial = radial / radial.mean()
     dcf = mr2.data.DcfData(unsqueeze_left(radial, 4))
 
     return trajectory, dcf
