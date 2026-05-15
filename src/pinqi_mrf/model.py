@@ -529,9 +529,7 @@ class PinqiModule(pl.LightningModule):
                     parameter_mask,
                 )
         loss = (
-            components['base']
-            + self.hparams.loss_l1 * components['l1']
-            + self.hparams.loss_ssim * components['ssim']
+            components['base'] + self.hparams.loss_l1 * components['l1'] + self.hparams.loss_ssim * components['ssim']
         )
         return loss, components
 
