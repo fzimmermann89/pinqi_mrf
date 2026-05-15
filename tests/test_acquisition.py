@@ -8,8 +8,9 @@ def test_create_radial_trajectory() -> None:
     n_spokes = 5
     n_readout_samples = 7
 
-    trajectory = create_radial_trajectory(n_spokes=n_spokes, n_readout_samples=n_readout_samples)
+    trajectory, dcf = create_radial_trajectory(n_spokes=n_spokes, n_readout_samples=n_readout_samples)
 
     assert trajectory.shape == (n_spokes, 1, 1, 1, n_readout_samples)
     assert trajectory.kx.shape == (n_spokes, 1, 1, 1, n_readout_samples)
     assert trajectory.ky.shape == (n_spokes, 1, 1, 1, n_readout_samples)
+    assert dcf.shape[-1] == n_readout_samples

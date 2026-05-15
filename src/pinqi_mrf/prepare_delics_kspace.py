@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +14,7 @@ import mr2
 import numpy as np
 import scipy.ndimage as ndimage
 import torch
-from tqdm import tqdm  # type: ignore[import-untyped]
+from tqdm import tqdm
 
 from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 
@@ -38,16 +38,12 @@ class ConversionConfig:
     dictionary_batch_size: int = DEFAULT_DICTIONARY_BATCH_SIZE
 
 
-def create_radial_dcf(n_timepoints: int, n_readout_samples: int) -> np.ndarray:
-    """Create a simple mean-normalized radial ramp DCF."""
-    center = n_readout_samples // 2
-    radius = np.abs(np.arange(n_readout_samples, dtype=np.float32) - center)
-    if n_readout_samples > 1:
-        nonzero = radius[radius > 0]
-        radius[center] = nonzero.min() if nonzero.size else 1.0
-    radius /= np.mean(radius, dtype=np.float64)
-    dcf = np.broadcast_to(radius.reshape(1, 1, 1, 1, n_readout_samples), (n_timepoints, 1, 1, 1, n_readout_samples))
-    return np.asarray(dcf, dtype=np.float32)
+@dataclass(frozen=True)
+class ReferenceDictionary:
+    """Dictionary matcher and signal generator for reference maps."""
+
+    matcher: mr2.operators.DictionaryMatchOp
+    signal: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor]]
 
 
 def create_mask(
@@ -121,33 +117,36 @@ def create_dictionary_matcher(
     device: torch.device,
     *,
     batch_size: int = DEFAULT_DICTIONARY_BATCH_SIZE,
-) -> mr2.operators.DictionaryMatchOp:
+) -> ReferenceDictionary:
     """Create full-frame NeuroMRF dictionary matcher for reference maps."""
     signal = mr2.operators.models.NeuroMRF().to(device)
 
-    def signal_without_b1(m0: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor]:
+    def signal_with_m0(m0: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor]:
         return signal(m0, t1, t2)
 
-    dictionary_match = mr2.operators.DictionaryMatchOp(
-        signal_without_b1,
-        index_of_scaling_parameter=0,
-        batch_size=batch_size,
-    )
+    def signal_without_m0(t1: torch.Tensor, t2: torch.Tensor) -> tuple[torch.Tensor]:
+        m0 = torch.ones((), dtype=torch.complex64, device=device)
+        return signal_with_m0(m0, t1, t2)
+
+    dictionary_match = mr2.operators.DictionaryMatchOp(signal_without_m0, batch_size=batch_size)
     t1 = torch.linspace(0.2, 4.0, 100, device=device)[:, None]
     t2 = torch.linspace(0.01, 0.3, 100, device=device)[None, :]
-    dictionary_match.append(torch.tensor(1.0 + 0.0j, device=device), t1, t2)
-    return dictionary_match
+    dictionary_match.append(t1, t2)
+    return ReferenceDictionary(matcher=dictionary_match, signal=signal_with_m0)
 
 
 def dictionary_match_reference(
     frames: torch.Tensor,
     csm: np.ndarray,
-    dictionary_match: mr2.operators.DictionaryMatchOp,
+    reference_dictionary: ReferenceDictionary,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Dictionary-match coil-combined full-frame references."""
     csm_tensor = torch.as_tensor(csm, dtype=frames.dtype, device=frames.device)
     combined = (frames.squeeze(2) * csm_tensor[:, 0].conj()).sum(dim=1)
-    m0, t1, t2 = dictionary_match(combined.detach())
+    t1, t2 = reference_dictionary.matcher(combined.detach())
+    (matched_signal,) = reference_dictionary.signal(torch.ones_like(t1, dtype=frames.dtype), t1, t2)
+    denominator = matched_signal.abs().square().sum(dim=0).clamp_min(1e-12)
+    m0 = (combined * matched_signal.conj()).sum(dim=0) / denominator
     return (
         m0.cpu().numpy().astype(np.complex64),
         t1.cpu().numpy().astype(np.float32),
@@ -292,7 +291,8 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
         if tmp_path.exists():
             tmp_path.unlink()
 
-        traj = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples).to(device)
+        trajectory, dcf_tensor = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
+        traj = trajectory.to(device)
         matrix = mr2.data.SpatialDimension(1, size_y, size_x)
         nufft = mr2.operators.NonUniformFastFourierOp(
             direction=(-2, -1),
@@ -300,7 +300,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
             encoding_matrix=matrix,
             traj=traj,
         )
-        dcf = create_radial_dcf(n_timepoints, n_readout_samples)
+        dcf = dcf_tensor.numpy()
         dictionary_match = create_dictionary_matcher(device, batch_size=config.dictionary_batch_size)
 
         with h5py.File(tmp_path, 'w') as target, torch.inference_mode():

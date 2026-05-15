@@ -313,9 +313,10 @@ class PinqiModule(pl.LightningModule):
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
+        use_density_compensation: bool = True,
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,
-        csm_estimation_iterations: int = 2,
+        csm_estimation_iterations: int = 10,
         csm_estimation_smoothing_width: int = 11,
         csm_extrapolate: bool = True,
         csm_refinement_iterations: tuple[int, ...] = (),
@@ -353,10 +354,11 @@ class PinqiModule(pl.LightningModule):
         self.csm_estimation_iterations = csm_estimation_iterations
         self.csm_estimation_smoothing_width = csm_estimation_smoothing_width
         self.csm_extrapolate = csm_extrapolate
+        self.use_density_compensation = use_density_compensation
         self.matrix_size = mr2.data.SpatialDimension(1, image_size, image_size)
         match trajectory:
             case 'radial':
-                self.traj = create_radial_trajectory(
+                self.trajectory, self.dcf = create_radial_trajectory(
                     n_spokes=self.signalmodel.n_timepoints,
                     n_readout_samples=n_readout_samples,
                 )
@@ -404,14 +406,21 @@ class PinqiModule(pl.LightningModule):
             direction=(-2, -1),
             recon_matrix=self.matrix_size,
             encoding_matrix=self.matrix_size,
-            traj=self.traj.to(self.device),
+            traj=self.trajectory.to(self.device),
         )
-        self.subspace_gram = cast(
-            SubspaceNonUniformFastFourierOpGramOp,
-            nufft_op.toeplitz(subspace=self.signalmodel.pca, subspace_dim=1),
-        )
+        if self.use_density_compensation:
+            weight = self.dcf.data.to(self.device)
+            subspace_gram = nufft_op.toeplitz(weight=weight, subspace=self.signalmodel.pca, subspace_dim=1)
+
+            noise_subspace_gram = nufft_op.toeplitz(weight=weight**2, subspace=self.signalmodel.pca, subspace_dim=1)
+
+        else:
+            subspace_gram = nufft_op.toeplitz(weight=None, subspace=self.signalmodel.pca, subspace_dim=1)
+            noise_subspace_gram = subspace_gram
+
+        self.subspace_gram = cast(SubspaceNonUniformFastFourierOpGramOp, subspace_gram)
         self.noise_sampler = WhiteKspaceSubspaceRhsNoiseSampler(
-            self.subspace_gram,
+            cast(SubspaceNonUniformFastFourierOpGramOp, noise_subspace_gram),
             n_coils=self.n_coils,
         )
 
