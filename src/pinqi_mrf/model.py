@@ -516,7 +516,10 @@ class PinqiModule(pl.LightningModule):
             prediction_parameters = predictions[-1][1:]
             if self.hparams.loss_l1:
                 components['l1'] = sum(
-                    torch.nn.functional.l1_loss(prediction[:, :, :, parameter_mask], target[:, :, :, parameter_mask])
+                    torch.nn.functional.l1_loss(
+                        prediction.squeeze(1, 2)[parameter_mask],
+                        target.squeeze(1, 2)[parameter_mask],
+                    )
                     for prediction, target in zip(prediction_parameters, target_parameters, strict=True)
                 )
             if self.hparams.loss_ssim:
