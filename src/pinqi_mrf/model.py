@@ -15,7 +15,7 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 
 from pinqi_mrf.acquisition import create_radial_trajectory
 from pinqi_mrf.data import BatchType
-from pinqi_mrf.losses import charbonnier_loss, ssim_loss
+from pinqi_mrf.losses import ssim_loss
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxation_time
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
@@ -332,7 +332,7 @@ class PinqiModule(pl.LightningModule):
         lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
         loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
-        loss_charbonnier: float = 0.0,  # noqa: ARG002
+        loss_l1: float = 0.0,  # noqa: ARG002
         loss_ssim: float = 0.0,  # noqa: ARG002
     ) -> None:
         """Initialize the Lightning module."""
@@ -486,7 +486,7 @@ class PinqiModule(pl.LightningModule):
         """Compute parameter loss in standardized parameter space."""
         components = {
             'base': torch.tensor(0.0, device=self.device),
-            'charbonnier': torch.tensor(0.0, device=self.device),
+            'l1': torch.tensor(0.0, device=self.device),
             'ssim': torch.tensor(0.0, device=self.device),
         }
         target_m0, target_r1, target_r2, mask = batch['m0'], batch['r1'], batch['r2'], batch['mask']
@@ -510,15 +510,14 @@ class PinqiModule(pl.LightningModule):
                 components['r2'] = loss_r2
                 components['m0'] = loss_m0
                 components['outside'] = loss_outside
-        if self.hparams.loss_charbonnier or self.hparams.loss_ssim:
+        if self.hparams.loss_l1 or self.hparams.loss_ssim:
             target_parameters = (target_r1[:, None, None], target_r2[:, None, None])
             # The first parameter is the pure scaling parameter M0; detail losses act on quantitative parameters.
             prediction_parameters = predictions[-1][1:]
-            if self.hparams.loss_charbonnier:
-                components['charbonnier'] = charbonnier_loss(
-                    prediction_parameters,
-                    target_parameters,
-                    parameter_mask,
+            if self.hparams.loss_l1:
+                components['l1'] = sum(
+                    torch.nn.functional.l1_loss(prediction[:, :, :, parameter_mask], target[:, :, :, parameter_mask])
+                    for prediction, target in zip(prediction_parameters, target_parameters, strict=True)
                 )
             if self.hparams.loss_ssim:
                 components['ssim'] = ssim_loss(
@@ -528,7 +527,7 @@ class PinqiModule(pl.LightningModule):
                 )
         loss = (
             components['base']
-            + self.hparams.loss_charbonnier * components['charbonnier']
+            + self.hparams.loss_l1 * components['l1']
             + self.hparams.loss_ssim * components['ssim']
         )
         return loss, components
