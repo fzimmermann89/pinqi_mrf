@@ -19,7 +19,7 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import mr2
 import torch
 
-from pinqi_mrf.data import BrainwebDataset, BatchType
+from pinqi_mrf.data import BatchType, BrainwebDataset
 from pinqi_mrf.model import MIN_SUPERVISED_T1, MIN_SUPERVISED_T2, PinqiModule
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxation_time
 
@@ -61,9 +61,7 @@ def loss_without_logging(
     batch: BatchType,
 ) -> torch.Tensor:
     """Compute the PINQI-MRF training loss without Lightning logging."""
-    target_m0, target_r1, target_r2, mask = map(
-        torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask'])
-    )
+    target_m0, target_r1, target_r2, mask = map(torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask']))
     mask = mask.bool()
     target_t1 = standardized_rate_to_relaxation_time(target_r1, R1_STATS)
     target_t2 = standardized_rate_to_relaxation_time(target_r2, R2_STATS)
@@ -158,9 +156,7 @@ def main() -> None:
             with torch.profiler.record_function('simulate_coil_rhs'):
                 coil_rhs, csm_ground_truth = model.simulate_coil_rhs(batch)
             with torch.profiler.record_function('estimate_or_select_csm'):
-                csm_initial = (
-                    csm_ground_truth if args.use_ground_truth_csm else model.estimate_initial_csm(coil_rhs)
-                )
+                csm_initial = csm_ground_truth if args.use_ground_truth_csm else model.estimate_initial_csm(coil_rhs)
             with torch.profiler.record_function('pinqi_forward'):
                 _images, parameters = model(coil_rhs, csm_initial=csm_initial)
             with torch.profiler.record_function('loss'):

@@ -15,6 +15,7 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 
 from pinqi_mrf.acquisition import create_radial_trajectory
 from pinqi_mrf.data import BatchType
+from pinqi_mrf.losses import charbonnier_loss, ssim_loss
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxation_time
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
@@ -331,6 +332,8 @@ class PinqiModule(pl.LightningModule):
         lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
         loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
+        loss_charbonnier: float = 0.0,  # noqa: ARG002
+        loss_ssim: float = 0.0,  # noqa: ARG002
     ) -> None:
         """Initialize the Lightning module."""
         super().__init__()
@@ -479,20 +482,21 @@ class PinqiModule(pl.LightningModule):
         self,
         predictions: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         batch: BatchType,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute parameter loss in standardized parameter space."""
-        loss = torch.tensor(0.0, device=self.device)
-        target_m0, target_r1, target_r2, mask = map(
-            torch.squeeze, (batch['m0'], batch['r1'], batch['r2'], batch['mask'])
-        )
+        components = {
+            'base': torch.tensor(0.0, device=self.device),
+            'charbonnier': torch.tensor(0.0, device=self.device),
+            'ssim': torch.tensor(0.0, device=self.device),
+        }
+        target_m0, target_r1, target_r2, mask = batch['m0'], batch['r1'], batch['r2'], batch['mask']
         mask = mask.bool()
         target_t1 = standardized_rate_to_relaxation_time(target_r1, R1_STATS)
         target_t2 = standardized_rate_to_relaxation_time(target_r2, R2_STATS)
         parameter_mask = self._parameter_mask(mask, target_r1, target_r2, target_t1, target_t2)
-        log_debug = self.training and self.global_step % 10 == 0
         final_iteration = len(predictions) - 1
         for iteration, (prediction, weight) in enumerate(zip(predictions, self.hparams.loss_weights, strict=True)):
-            prediction_m0, prediction_r1, prediction_r2 = map(torch.squeeze, prediction)
+            prediction_m0, prediction_r1, prediction_r2 = (parameter.squeeze(1, 2) for parameter in prediction)
             loss_r1 = torch.nn.functional.mse_loss(prediction_r1[parameter_mask], target_r1[parameter_mask])
             loss_r2 = torch.nn.functional.mse_loss(prediction_r2[parameter_mask], target_r2[parameter_mask])
             loss_m0 = torch.nn.functional.mse_loss(
@@ -500,25 +504,34 @@ class PinqiModule(pl.LightningModule):
                 torch.view_as_real(target_m0.to(prediction_m0.dtype)[parameter_mask]),
             )
             loss_outside = prediction_m0[~mask].abs().mean()
-            if log_debug and iteration == final_iteration:
-                self.log_dict(
-                    {
-                        'debug/loss_r1': loss_r1.detach(),
-                        'debug/loss_r2': loss_r2.detach(),
-                        'debug/loss_m0': loss_m0.detach(),
-                        'debug/loss_outside': loss_outside.detach(),
-                        'debug/parameter_mask_fraction': parameter_mask.float().mean(),
-                        'debug/target_t1_min': target_t1[mask].detach().amin(),
-                        'debug/target_t2_min': target_t2[mask].detach().amin(),
-                        'debug/pred_r1_abs_max': prediction_r1.detach().abs().max(),
-                        'debug/pred_r2_abs_max': prediction_r2.detach().abs().max(),
-                    },
-                    on_step=True,
-                    on_epoch=False,
-                    rank_zero_only=True,
+            components['base'] = components['base'] + weight * (loss_r1 + loss_r2 + 0.5 * loss_m0 + 0.1 * loss_outside)
+            if iteration == final_iteration:
+                components['r1'] = loss_r1
+                components['r2'] = loss_r2
+                components['m0'] = loss_m0
+                components['outside'] = loss_outside
+        if self.hparams.loss_charbonnier or self.hparams.loss_ssim:
+            target_parameters = (target_r1[:, None, None], target_r2[:, None, None])
+            # The first parameter is the pure scaling parameter M0; detail losses act on quantitative parameters.
+            prediction_parameters = predictions[-1][1:]
+            if self.hparams.loss_charbonnier:
+                components['charbonnier'] = charbonnier_loss(
+                    prediction_parameters,
+                    target_parameters,
+                    parameter_mask,
                 )
-            loss = loss + weight * (loss_r1 + loss_r2 + 0.5 * loss_m0 + 0.1 * loss_outside)
-        return loss
+            if self.hparams.loss_ssim:
+                components['ssim'] = ssim_loss(
+                    prediction_parameters,
+                    target_parameters,
+                    parameter_mask,
+                )
+        loss = (
+            components['base']
+            + self.hparams.loss_charbonnier * components['charbonnier']
+            + self.hparams.loss_ssim * components['ssim']
+        )
+        return loss, components
 
     def training_step(self, batch: BatchType, _batch_idx: int) -> torch.Tensor:
         """Run one training step."""
@@ -527,8 +540,15 @@ class PinqiModule(pl.LightningModule):
         if self.global_step % 10 == 0:
             self.log_csm_diagnostics(csm_initial, prefix='debug/train_csm')
         _images, parameters = self(coil_rhs, csm_initial=csm_initial)
-        loss = self.loss(parameters, batch)
+        loss, components = self.loss(parameters, batch)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        if self.global_step % 10 == 0:
+            self.log_dict(
+                {f'debug/train_loss_{key}': value.detach() for key, value in components.items()},
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
         return loss
 
     def validation_step(self, batch: BatchType, batch_idx: int) -> None:
@@ -541,7 +561,7 @@ class PinqiModule(pl.LightningModule):
             raise RuntimeError('Acquisition operators have not been initialized.')
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
         _images, parameters = self(coil_rhs, csm_initial=csm_initial)
-        loss = self.loss(parameters, batch)
+        loss, components = self.loss(parameters, batch)
         _pred_m0, pred_r1, pred_r2 = parameters[-1]
         _baseline_m0, baseline_r1, baseline_r2 = self.baseline(rhs, normal_op)
         mask = batch['mask'].bool()
@@ -618,6 +638,12 @@ class PinqiModule(pl.LightningModule):
         self.log('val/rmse_t1_baseline', baseline_rmse_t1, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/rmse_t2_baseline', baseline_rmse_t2, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log('val/loss', loss, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log_dict(
+            {f'val/loss_{key}': value.detach() for key, value in components.items()},
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
         self.log('val/debug/pred_t2_abs_max', pred_t2_raw_masked.abs().amax(), on_epoch=True, sync_dist=True)
         self.log('val/debug/pred_t2_min', pred_t2_raw_masked.amin(), on_epoch=True, sync_dist=True)
         self.log('val/debug/pred_t2_p99', torch.quantile(pred_t2_raw_masked, 0.99), on_epoch=True, sync_dist=True)
