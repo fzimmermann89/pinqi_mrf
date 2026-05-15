@@ -46,6 +46,8 @@ class PinqiLightningCLI(LightningCLI):
             default=None,
             help='Checkpoint directory name. Defaults to a generated run id.',
         )
+        parser.link_arguments('data.n_coils', 'model.n_coils', apply_on='instantiate')
+        parser.link_arguments('data.size', 'model.image_size', apply_on='instantiate')
 
     def before_instantiate_classes(self) -> None:
         """Configure logging and checkpointing before Trainer instantiation."""
