@@ -7,10 +7,17 @@ from mr2.utils import unsqueeze_left
 RADIAL_GOLDEN_ANGLE = 1.9416129845950924
 
 
+class AcquisitionData(mr2.data.Dataclass):
+    """Trajectory and density compensation data."""
+
+    trajectory: mr2.data.KTrajectory
+    dcf: mr2.data.DcfData
+
+
 def create_radial_trajectory(
     n_spokes: int,
     n_readout_samples: int,
-) -> tuple[mr2.data.KTrajectory, mr2.data.DcfData]:
+) -> AcquisitionData:
     """Create a 2D radial trajectory and analytical DCF with one spoke per time frame."""
     center = n_readout_samples // 2
     trajectory = mr2.data.traj_calculators.KTrajectoryRadial2D(RADIAL_GOLDEN_ANGLE)(
@@ -23,7 +30,7 @@ def create_radial_trajectory(
     if n_readout_samples > 1:
         nonzero = radial[radial > 0]
         radial[center] = nonzero.min() if nonzero.numel() else 1.0
-    radial = radial / radial.mean()
+    radial = radial.float() / radial.float().mean()
     dcf = mr2.data.DcfData(unsqueeze_left(radial, 4))
 
-    return trajectory, dcf
+    return AcquisitionData(trajectory=trajectory, dcf=dcf)

@@ -1,9 +1,47 @@
 """Tests for model-side operator composition helpers."""
 
+from pathlib import Path
+
 import mr2
+import pytest
 import torch
 
-from pinqi_mrf.model import PINQI
+from pinqi_mrf.finetune import FineTuneModule
+from pinqi_mrf.pinqi import PINQI, PINQIConfig
+
+
+class DummyScalingSignalModel(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch.Tensor]):
+    """Small signal model with a pure multiplicative first parameter."""
+
+    def forward(self, m0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor) -> tuple[torch.Tensor]:
+        """Evaluate the dummy signal model."""
+        signal = torch.stack(
+            (
+                1 + p1,
+                2 + p2,
+                p1 + 1j * p2,
+            ),
+            dim=0,
+        )
+        return (m0 * signal,)
+
+
+def create_small_finetune_module(**kwargs: object) -> FineTuneModule:
+    """Create a small fine-tuning module for checkpoint-loading tests."""
+    return FineTuneModule(
+        signalmodel=DummyScalingSignalModel(),
+        n_subspace_coefficients=2,
+        image_size=8,
+        n_readout_samples=8,
+        n_coils=2,
+        n_timepoints=2,
+        parameter_ranges=((-0.5, 0.5, 4), (-0.5, 0.5, 4)),
+        n_iterations=1,
+        n_features_parameter_net=(32, 64),
+        n_features_image_net=(32, 64),
+        nonlinear_solver_batch_size=4,
+        **kwargs,
+    )
 
 
 def test_csm_refinement_solver_matches_manual_expression() -> None:
@@ -19,7 +57,17 @@ def test_csm_refinement_solver_matches_manual_expression() -> None:
     )
     regularization_weight = torch.tensor(0.25)
     pinqi = PINQI.__new__(PINQI)
-    pinqi.csm_refinement_cg_iterations = 1
+    pinqi.config = PINQIConfig(
+        csm_refinement_iterations=(),
+        csm_refinement_shape=(2, 3),
+        csm_refinement_weight=0.0,
+        csm_refinement_cg_iterations=1,
+        initial_cg_iterations=1,
+        initial_cg_regularization=0.0,
+        image_cg_iterations=1,
+        image_cg_tolerance=0.0,
+        n_parameter_priors=3,
+    )
     solver = pinqi.get_csm_refinement_solver(
         downsampling=downsampling,
         subspace_gram=mr2.operators.IdentityOp(),
@@ -44,3 +92,48 @@ def test_csm_refinement_solver_matches_manual_expression() -> None:
 
     torch.testing.assert_close(actual_operator_result, expected_operator_result)
     torch.testing.assert_close(actual_rhs, expected_rhs)
+
+
+def test_finetune_module_loads_pretrained_checkpoint_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fine-tuning checkpoint initialization loads weights without trainer state."""
+    monkeypatch.setattr(torch, 'compile', lambda module: module)
+    source = create_small_finetune_module()
+    with torch.no_grad():
+        for index, parameter in enumerate(source.parameters()):
+            parameter.fill_(0.01 * (index + 1))
+
+    checkpoint_path = tmp_path / 'pretrain.ckpt'
+    torch.save({'state_dict': source.state_dict(), 'epoch': 17, 'global_step': 123}, checkpoint_path)
+
+    target = create_small_finetune_module(pretrained_checkpoint=checkpoint_path)
+
+    for key, expected in source.state_dict().items():
+        torch.testing.assert_close(target.state_dict()[key], expected)
+    assert target.current_epoch == 0
+    assert target.global_step == 0
+
+
+def test_teacher_parameter_loss_uses_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Teacher parameter loss ignores voxels outside the mask."""
+    monkeypatch.setattr(torch, 'compile', lambda module: module)
+    module = create_small_finetune_module()
+    prediction = (
+        torch.zeros(1, 1, 1, 2, 2, dtype=torch.complex64),
+        torch.zeros(1, 1, 1, 2, 2),
+        torch.zeros(1, 1, 1, 2, 2),
+    )
+    target = (
+        torch.zeros(1, 1, 1, 2, 2, dtype=torch.complex64),
+        torch.zeros(1, 1, 1, 2, 2),
+        torch.zeros(1, 1, 1, 2, 2),
+    )
+    target[1][..., 0, 0] = 2.0
+    target[1][..., 1, 1] = 10.0
+    mask = torch.tensor([[[True, False], [False, False]]])
+
+    loss = module.teacher_parameter_loss([prediction], target, mask)
+
+    torch.testing.assert_close(loss, torch.tensor(4.0))
