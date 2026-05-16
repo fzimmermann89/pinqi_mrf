@@ -45,6 +45,7 @@ class PINQI(torch.nn.Module):
         image_cg_tolerance: float = 1e-5,
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         nonlinear_solver_batch_size: int = 8192,
+        weight_scaling: bool = False,
     ) -> None:
         """Initialize the model."""
         super().__init__()
@@ -83,6 +84,7 @@ class PINQI(torch.nn.Module):
         lambdas_raw = torch.ones(n_iterations, 2 + self.config.n_parameter_priors)
         self.lambdas_raw = torch.nn.Parameter(lambdas_raw)
         self.softplus = torch.nn.Softplus(beta=5)
+        self.weight_scaling = weight_scaling
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
         self.nonlinear_solver = mr2.operators.DifferentiableDictionaryMatchOp(
             self.signalmodel,
@@ -98,6 +100,11 @@ class PINQI(torch.nn.Module):
             grid_shape[parameter_idx] = grid.numel()
             broadcasted_grids.append(grid.reshape(grid_shape))
         self.nonlinear_solver.append(torch.tensor(1.0 + 0j), *broadcasted_grids)
+        prior_weight_scale = [self.nonlinear_solver.norm_y.square().mean().real]
+        prior_weight_scale.extend(
+            partial.abs().square().sum(dim=0).mean().real for partial in self.nonlinear_solver.partials
+        )
+        self.register_buffer('prior_weight_scale', torch.stack(prior_weight_scale).to(torch.float32))
 
     def get_linear_solver(self, normal_op: mr2.operators.LinearOperator) -> mr2.operators.ConjugateGradientOp:
         """Create the image update solver."""
@@ -130,6 +137,7 @@ class PINQI(torch.nn.Module):
         downsampling: mr2.operators.LinearOperator,
         subspace_gram: mr2.operators.LinearOperator,
         regularization_weight: float | torch.Tensor,
+        weight_scale: torch.Tensor | None = None,
     ) -> mr2.operators.ConjugateGradientOp:
         """Create the low-resolution CSM refinement solver."""
 
@@ -141,7 +149,10 @@ class PINQI(torch.nn.Module):
                 )
                 @ downsampling.H
             )
-            return coil_lift.H @ subspace_gram @ coil_lift + regularization_weight
+            operator = coil_lift.H @ subspace_gram @ coil_lift
+            if weight_scale is not None:
+                operator = weight_scale.reciprocal() * operator
+            return operator + regularization_weight
 
         def rhs_factory(
             alpha: torch.Tensor,
@@ -156,6 +167,8 @@ class PINQI(torch.nn.Module):
                 @ downsampling.H
             )
             (rhs,) = coil_lift.H(coil_rhs)
+            if weight_scale is not None:
+                rhs = rhs / weight_scale
             return (rhs + regularization_weight * csm_low_initial,)
 
         return mr2.operators.ConjugateGradientOp(
@@ -175,6 +188,17 @@ class PINQI(torch.nn.Module):
         normal_op = csm_op.H @ subspace_gram @ csm_op
         (rhs,) = csm_op.H(coil_rhs)
         return rhs, normal_op
+
+    @staticmethod
+    def scale_linear_system(
+        rhs: torch.Tensor,
+        normal_op: mr2.operators.LinearOperator,
+        weight_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, mr2.operators.LinearOperator]:
+        """Apply optional scalar normalization to a linear system."""
+        if weight_scale is None:
+            return rhs, normal_op
+        return rhs / weight_scale, weight_scale.reciprocal() * normal_op
 
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> ParameterTuple:
         """Predict parameter-space prior from the current image estimate."""
@@ -212,9 +236,11 @@ class PINQI(torch.nn.Module):
         coil_rhs: torch.Tensor,
         csm_initial: torch.Tensor,
         subspace_gram: mr2.operators.LinearOperator,
+        weight_scale: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor], list[ParameterTuple]]:
         """Apply the unrolled PINQI reconstruction."""
         rhs, normal_op = self.get_normal_equations(coil_rhs, csm_initial, subspace_gram)
+        rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
         images = list(
             mr2.algorithms.optimizers.cg(
                 normal_op + self.config.initial_cg_regularization,
@@ -235,6 +261,7 @@ class PINQI(torch.nn.Module):
                 downsampling=downsampling,
                 subspace_gram=subspace_gram,
                 regularization_weight=self.config.csm_refinement_weight,
+                weight_scale=weight_scale,
             )
 
         for iteration, (lambda_image, lambda_q, *lambda_parameters) in enumerate(self.softplus(self.lambdas_raw)):
@@ -243,6 +270,15 @@ class PINQI(torch.nn.Module):
             parameter_reg = self.get_parameter_reg(images[-1], iteration)
             if len(lambda_parameters) != self.config.n_parameter_priors:
                 raise RuntimeError('Number of parameter prior weights must match the parameter prior tuple.')
+            if self.weight_scaling:
+                lambda_parameters = tuple(
+                    lambda_parameter * scale.to(lambda_parameter)
+                    for lambda_parameter, scale in zip(
+                        lambda_parameters,
+                        self.prior_weight_scale,
+                        strict=True,
+                    )
+                )
             parameter, signal = self.nonlinear_solver(
                 images[-1].swapaxes(0, 1),
                 prior=parameter_reg,
@@ -261,6 +297,7 @@ class PINQI(torch.nn.Module):
                 phase = alignment / alignment.abs().clamp_min(1e-8)
                 csm_refined = csm_refined * phase.conj()
                 rhs, normal_op = self.get_normal_equations(coil_rhs, csm_refined, subspace_gram)
+                rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
                 linear_solver = self.get_linear_solver(normal_op)
         return images, parameters
 

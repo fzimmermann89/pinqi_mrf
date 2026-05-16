@@ -36,6 +36,7 @@ class PretrainHParams(Protocol):
     csm_estimation_smoothing_width: int
     csm_extrapolate: bool
     use_density_compensation: bool
+    weight_scaling: bool
     lr: float
     weight_decay: float
     loss_weights: Sequence[float]
@@ -74,6 +75,7 @@ class BaseModule(pl.LightningModule):
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
         use_density_compensation: bool = True,  # noqa: ARG002
+        weight_scaling: bool = False,
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,  # noqa: ARG002
         csm_estimation_iterations: int = 10,  # noqa: ARG002
@@ -133,6 +135,7 @@ class BaseModule(pl.LightningModule):
             image_cg_tolerance=image_cg_tolerance,
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
+            weight_scaling=weight_scaling,
         )
         self.baseline = BaselineReconstruction(
             signalmodel=self.signalmodel,
@@ -141,6 +144,7 @@ class BaseModule(pl.LightningModule):
         )
         self.validation_step_outputs: dict[str, torch.Tensor] = {}
         self.subspace_gram: SubspaceNonUniformFastFourierOpGramOp | None = None
+        self.subspace_gram_scale: torch.Tensor | None = None
         self.noise_sampler: WhiteKspaceSubspaceRhsNoiseSampler | None = None
 
     @property
@@ -179,10 +183,29 @@ class BaseModule(pl.LightningModule):
             noise_subspace_gram = subspace_gram
 
         self.subspace_gram = cast(SubspaceNonUniformFastFourierOpGramOp, subspace_gram)
+        self.subspace_gram_scale = (
+            self.estimate_subspace_gram_scale(self.subspace_gram) if self.hparams.weight_scaling else None
+        )
         self.noise_sampler = WhiteKspaceSubspaceRhsNoiseSampler(
             cast(SubspaceNonUniformFastFourierOpGramOp, noise_subspace_gram),
             n_coils=self.hparams.n_coils,
         )
+
+    def estimate_subspace_gram_scale(self, subspace_gram: SubspaceNonUniformFastFourierOpGramOp) -> torch.Tensor:
+        """Estimate a scalar normalization for a subspace Toeplitz Gram operator."""
+        initial_value = torch.randn(
+            (
+                1,
+                self.hparams.n_subspace_coefficients,
+                self.matrix_size.z,
+                self.matrix_size.y,
+                self.matrix_size.x,
+            ),
+            device=self.device,
+            dtype=torch.complex64,
+        )
+        scale = subspace_gram.operator_norm(initial_value, dim=(1, 2, 3, 4)).amax().real
+        return scale.clamp_min(torch.finfo(scale.dtype).eps)
 
     def compress_coils(self, coil_rhs: torch.Tensor, csm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compress the coil dimension using an SVD of the coilwise RHS."""
@@ -234,7 +257,7 @@ class BaseModule(pl.LightningModule):
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
         csm_initial = csm_initial if csm_initial is not None else self.estimate_initial_csm(coil_rhs)
-        return self.pinqi(coil_rhs, csm_initial, self.subspace_gram)
+        return self.pinqi(coil_rhs, csm_initial, self.subspace_gram, weight_scale=self.subspace_gram_scale)
 
     def log_csm_diagnostics(self, csm: torch.Tensor, prefix: str) -> None:
         """Log coil-wise CSM normalization diagnostics."""
