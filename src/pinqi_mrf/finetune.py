@@ -78,6 +78,7 @@ class FineTuneModule(BaseModule):
         self.current_nufft_in: mr2.operators.NonUniformFastFourierOp | None = None
         self.current_nufft_loss: mr2.operators.NonUniformFastFourierOp | None = None
         self.current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None = None
+        self.current_subspace_gram_in_scale: torch.Tensor | None = None
         self.teacher_cache: dict[tuple[str, int], TeacherSlice] = {}
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
@@ -98,6 +99,7 @@ class FineTuneModule(BaseModule):
 
     def on_fit_start(self) -> None:
         """Defer SSDU operator construction to epoch start."""
+        super().on_fit_start()
         if (
             self.hparams.teacher_loss_weight
             and self.hparams.pretrained_checkpoint is None
@@ -107,6 +109,7 @@ class FineTuneModule(BaseModule):
 
     def on_validation_start(self) -> None:
         """Defer SSDU operator construction to epoch start."""
+        super().on_validation_start()
 
     def on_train_epoch_start(self) -> None:
         """Update the epoch-wise SSDU split and visible normal operator."""
@@ -161,6 +164,9 @@ class FineTuneModule(BaseModule):
         self.current_nufft_in = nufft_in
         self.current_nufft_loss = nufft_loss
         self.current_subspace_gram_in = cast(SubspaceNonUniformFastFourierOpGramOp, subspace_gram)
+        self.current_subspace_gram_in_scale = (
+            self.estimate_subspace_gram_scale(self.current_subspace_gram_in) if self.hparams.weight_scaling else None
+        )
 
     def refresh_teacher_cache(self) -> None:
         """Predict epoch-level teacher parameter maps for the DELICS training dataset."""
@@ -184,6 +190,7 @@ class FineTuneModule(BaseModule):
             SubspaceNonUniformFastFourierOpGramOp,
             nufft.toeplitz(weight=weight, subspace=subspace_basis, subspace_dim=1),
         )
+        teacher_weight_scale = self.subspace_gram_scale if self.hparams.weight_scaling else None
 
         self.teacher_cache.clear()
         was_training = self.training
@@ -195,7 +202,12 @@ class FineTuneModule(BaseModule):
                 kspace = cast(torch.Tensor, sample['kspace'])[None].to(self.device)
                 coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft)
                 csm_initial = self.estimate_initial_csm(coil_rhs)
-                _images, parameters = self.pinqi(coil_rhs, csm_initial, teacher_subspace_gram)
+                _images, parameters = self.pinqi(
+                    coil_rhs,
+                    csm_initial,
+                    teacher_subspace_gram,
+                    weight_scale=teacher_weight_scale,
+                )
                 local_teacher_slices.append(
                     (
                         index,
@@ -442,7 +454,12 @@ class FineTuneModule(BaseModule):
             raise RuntimeError('SSDU split has not been initialized.')
         coil_rhs = self.build_visible_coil_rhs(batch['kspace'])
         csm_initial = self.estimate_initial_csm(coil_rhs)
-        _images, parameters = self.pinqi(coil_rhs, csm_initial, self.current_subspace_gram_in)
+        _images, parameters = self.pinqi(
+            coil_rhs,
+            csm_initial,
+            self.current_subspace_gram_in,
+            weight_scale=self.current_subspace_gram_in_scale,
+        )
         kspace_loss = batch['kspace'][:, self.current_omega_loss.to(batch['kspace'].device)]
         kspace_prediction = self.predict_loss_kspace(parameters, csm_initial)
         return parameters[-1], parameters, self.ssdu_loss(kspace_prediction, kspace_loss)
@@ -455,7 +472,12 @@ class FineTuneModule(BaseModule):
             raise RuntimeError('SSDU split has not been initialized.')
         coil_rhs = self.build_visible_coil_rhs(kspace)
         csm_initial = self.estimate_initial_csm(coil_rhs)
-        _images, parameters = self.pinqi(coil_rhs, csm_initial, self.current_subspace_gram_in)
+        _images, parameters = self.pinqi(
+            coil_rhs,
+            csm_initial,
+            self.current_subspace_gram_in,
+            weight_scale=self.current_subspace_gram_in_scale,
+        )
         return parameters
 
     def synthetic_teacher_loss(
