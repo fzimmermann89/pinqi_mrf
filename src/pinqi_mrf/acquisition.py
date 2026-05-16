@@ -19,7 +19,7 @@ def create_radial_trajectory(
         k1_idx=torch.arange(n_spokes)[:, None, None, None, None],
     )
 
-    radial = (torch.arange(n_readout_samples) - center).abs()
+    radial = (torch.arange(n_readout_samples) - center).abs().float()
     if n_readout_samples > 1:
         nonzero = radial[radial > 0]
         radial[center] = nonzero.min() if nonzero.numel() else 1.0
