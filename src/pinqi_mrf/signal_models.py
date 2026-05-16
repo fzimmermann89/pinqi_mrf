@@ -103,5 +103,7 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
 
     def forward(self, m0: torch.Tensor, *parameters: torch.Tensor) -> tuple[torch.Tensor]:
         """Apply the subspace lookup."""
+        parameters = mr2.utils.unsqueeze_tensors_at(*parameters, dim=1, ndim=5)
         (coefficients,) = self.lookup(*parameters)
+        m0 = mr2.utils.unsqueeze_at(m0, dim=min(1, m0.ndim), n=coefficients.ndim - 1 - m0.ndim)
         return (m0 * coefficients,)

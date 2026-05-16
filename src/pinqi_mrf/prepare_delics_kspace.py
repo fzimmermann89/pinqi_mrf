@@ -14,7 +14,7 @@ import mr2
 import numpy as np
 import scipy.ndimage as ndimage
 import torch
-from tqdm import tqdm  # type: ignore[import-untyped]
+from tqdm import tqdm
 
 from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 
@@ -291,8 +291,8 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
         if tmp_path.exists():
             tmp_path.unlink()
 
-        trajectory, dcf = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
-        traj = trajectory.to(device)
+        acquisition = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
+        traj = acquisition.trajectory.to(device)
         matrix = mr2.data.SpatialDimension(1, size_y, size_x)
         nufft = mr2.operators.NonUniformFastFourierOp(
             direction=(-2, -1),
@@ -300,7 +300,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
             encoding_matrix=matrix,
             traj=traj,
         )
-        dcf_numpy = dcf.data.numpy()
+        dcf_numpy = acquisition.dcf.data.numpy()
         dictionary_match = create_dictionary_matcher(device, batch_size=config.dictionary_batch_size)
 
         with h5py.File(tmp_path, 'w') as target, torch.inference_mode():

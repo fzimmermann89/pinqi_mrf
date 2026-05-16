@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, TypedDict
 
+import h5py
 import lightning.pytorch as pl
 import mr2
 import torch
@@ -36,6 +37,139 @@ class BatchType(TypedDict):
     noise_std: torch.Tensor
 
 
+class DelicsRadialBatch(TypedDict):
+    """Type hint for one DELICS radial k-space sample."""
+
+    case_id: str
+    slice_index: torch.Tensor
+    kspace: torch.Tensor
+    mask: torch.Tensor
+
+
+class DelicsRadialDataset(torch.utils.data.Dataset):
+    """Dataset for pseudo-acquired DELICS radial k-space H5 files."""
+
+    def __init__(
+        self,
+        folder: Path,
+        *,
+        case_glob: str = 'delics_radial_case*.h5',
+        case_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Initialize the dataset."""
+        self.folder = folder
+        self.case_glob = case_glob
+        allowed_case_ids = set(case_ids) if case_ids is not None else None
+        self.files: list[tuple[Path, str]] = []
+        self.samples: list[tuple[int, int]] = []
+
+        for path in sorted(folder.glob(case_glob)):
+            with h5py.File(path, 'r') as handle:
+                case_id = str(handle.attrs.get('case', path.stem.removeprefix('delics_radial_')))
+                if allowed_case_ids is not None and case_id not in allowed_case_ids:
+                    continue
+                file_index = len(self.files)
+                self.files.append((path, case_id))
+                valid = handle['valid'][()].astype(bool)
+                for slice_index, is_valid in enumerate(valid):
+                    if bool(is_valid):
+                        self.samples.append((file_index, slice_index))
+
+        if not self.samples:
+            raise ValueError(f'No DELICS radial samples found in {folder} matching {case_glob!r}.')
+
+    def __len__(self) -> int:
+        """Return the number of available slices."""
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> DelicsRadialBatch:
+        """Get one DELICS radial k-space sample."""
+        file_index, slice_index = self.samples[index]
+        path, case_id = self.files[file_index]
+        with h5py.File(path, 'r') as handle:
+            return {
+                'case_id': case_id,
+                'slice_index': torch.tensor(slice_index, dtype=torch.int64),
+                'kspace': torch.as_tensor(handle['kspace'][slice_index], dtype=torch.complex64),
+                'mask': torch.as_tensor(handle['mask'][slice_index], dtype=torch.bool),
+            }
+
+
+class DelicsRadialDataModule(pl.LightningDataModule):
+    """Lightning data module for pseudo-acquired DELICS radial k-space."""
+
+    def __init__(
+        self,
+        folder: Path,
+        *,
+        train_case_ids: Sequence[str] | None = None,
+        val_case_ids: Sequence[str] | None = None,
+        case_glob: str = 'delics_radial_case*.h5',
+        batch_size: int = 1,
+        num_workers: int = 4,
+    ) -> None:
+        """Initialize the DELICS radial data module."""
+        super().__init__()
+        self.save_hyperparameters(ignore=['folder', 'num_workers'])
+        self.folder = folder
+        self.train_case_ids = train_case_ids
+        self.val_case_ids = val_case_ids
+        self.case_glob = case_glob
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.train_dataset: DelicsRadialDataset | None = None
+        self.val_dataset: DelicsRadialDataset | None = None
+
+    def setup(self, stage: str | None = None) -> None:
+        """Create training and optional validation datasets."""
+        _ = stage
+        if self.train_dataset is not None:
+            return
+        self.train_dataset = DelicsRadialDataset(
+            self.folder,
+            case_glob=self.case_glob,
+            case_ids=self.train_case_ids,
+        )
+        if self.val_case_ids is not None:
+            self.val_dataset = DelicsRadialDataset(
+                self.folder,
+                case_glob=self.case_glob,
+                case_ids=self.val_case_ids,
+            )
+
+    def train_dataloader(self) -> torch.utils.data.DataLoader:
+        """Return the DELICS training dataloader."""
+        if self.train_dataset is None:
+            raise RuntimeError('DelicsRadialDataModule.setup() must be called before train_dataloader().')
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=4 if self.num_workers > 0 else None,
+            persistent_workers=self.num_workers > 0,
+            worker_init_fn=lambda *_: torch.set_num_threads(1),
+            drop_last=False,
+        )
+
+    def val_dataloader(self) -> torch.utils.data.DataLoader | None:
+        """Return the optional DELICS validation dataloader."""
+        if self.val_case_ids is None:
+            return None
+        if self.val_dataset is None:
+            raise RuntimeError('DelicsRadialDataModule.setup() must be called before val_dataloader().')
+        return torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=False,
+            persistent_workers=self.num_workers > 0,
+            drop_last=False,
+        )
+
+
 class BrainwebDataset(torch.utils.data.Dataset):
     """BrainWeb-based dataset for parameter maps."""
 
@@ -44,7 +178,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         folder: Path,
         size: int = 256,
         n_coils: int = 8,
-        noise: tuple[float, float] = (0.0, 0.1),
+        noise: tuple[float, float] = (0.0, 0.05),
         r1_stats: tuple[float, float] = R1_STATS,
         r2_stats: tuple[float, float] = R2_STATS,
         orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
@@ -112,7 +246,7 @@ class DataModule(pl.LightningDataModule):
         folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         size: int = 256,
         n_coils: int = 8,
-        noise: tuple[float, float] = (0.0, 0.1),
+        noise: tuple[float, float] = (0.0, 0.05),
         r1_stats: tuple[float, float] = R1_STATS,
         r2_stats: tuple[float, float] = R2_STATS,
         batch_size: int = 6,
