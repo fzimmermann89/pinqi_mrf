@@ -112,8 +112,8 @@ class BaseModule(pl.LightningModule):
         n_subspace_coefficients: int = 10,
         image_size: int = 256,
         n_readout_samples: int = 256,
-        n_coils: int = 8,  # noqa: ARG002
-        n_compressed_coils: int | None = None,  # noqa: ARG002
+        n_coils: int = 12,  # noqa: ARG002
+        n_compressed_coils: int | None = 8,  # noqa: ARG002
         n_timepoints: int | None = None,
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
