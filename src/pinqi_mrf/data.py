@@ -14,8 +14,6 @@ import torch
 
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, relaxation_time_to_standardized_rate
 
-DEFAULT_DELICS_RADIAL_ROOT = Path('/scratch/zimmer08/delics/radial_kspace')
-
 BRAINWEB_VALUES_3T_RANDOMIZED = {
     'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.05), (-0.2, 0.2)),
     'gry': mr2.phantoms.brainweb.BrainwebTissue((1.200, 2.000), (0.080, 0.120), (0.70, 1.00), (-0.2, 0.2)),
@@ -181,7 +179,7 @@ class DelicsRadialDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        folder: Path = DEFAULT_DELICS_RADIAL_ROOT,
+        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
         *,
         train_case_ids: Sequence[str] | None = None,
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
@@ -489,8 +487,8 @@ class PretrainDataModule(pl.LightningDataModule):
         self,
         folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         *,
-        delics_val_folder: Path = DEFAULT_DELICS_RADIAL_ROOT,
-        delics_val_case_ids: Sequence[str],
+        delics_val_folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
+        delics_val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         size: int = 256,
         n_coils: int = 12,
         noise: tuple[float, float] = (0.0, 0.05),
@@ -569,9 +567,9 @@ class FineTuneDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        folder: Path = DEFAULT_DELICS_RADIAL_ROOT,
+        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
         *,
-        val_case_ids: Sequence[str],
+        val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         train_case_ids: Sequence[str] | None = None,
         case_glob: str = 'delics_radial_case*.h5',
         batch_size: int = 1,
