@@ -13,6 +13,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
 from pinqi_mrf.acquisition import AcquisitionData
+from pinqi_mrf.data import DelicsRadialBatch
 from pinqi_mrf.pinqi import ParameterTuple
 from pinqi_mrf.train import BaseModule, FineTuneHParams
 
@@ -236,21 +237,6 @@ class FineTuneModule(BaseModule):
             self.teacher_cache[(case_id, slice_index)] = teacher_slice
         rank_zero_info(f'Refreshed {len(self.teacher_cache)} DELICS teacher pseudo-reference slices.')
 
-    def build_coil_rhs(
-        self,
-        kspace: torch.Tensor,
-        acquisition: AcquisitionData,
-        subspace_basis: torch.Tensor,
-        nufft: mr2.operators.NonUniformFastFourierOp,
-    ) -> torch.Tensor:
-        """Build coilwise subspace RHS for a selected acquisition."""
-        if self.hparams.use_density_compensation:
-            (kspace,) = acquisition.dcf.as_operator()(kspace)
-        (coil_time_images,) = nufft.H(kspace)
-        return einops.einsum(
-            subspace_basis.conj(), coil_time_images, 'time coeff, batch time coil z y x -> batch coeff coil z y x'
-        )
-
     def build_visible_coil_rhs(self, kspace: torch.Tensor) -> torch.Tensor:
         """Build coilwise subspace RHS from the current visible k-space split."""
         if (
@@ -444,9 +430,7 @@ class FineTuneModule(BaseModule):
             loss = loss + (0.5 * component_loss if target_index == 0 else component_loss)
         return loss
 
-    def _reconstruct_batch(
-        self, batch: dict[str, torch.Tensor]
-    ) -> tuple[ParameterTuple, list[ParameterTuple], torch.Tensor]:
+    def _reconstruct_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, list[ParameterTuple], torch.Tensor]:
         """Run one SSDU reconstruction and return final predictions with held-out loss."""
         if self.current_subspace_gram_in is None:
             self.setup_ssdu_split()
@@ -481,7 +465,10 @@ class FineTuneModule(BaseModule):
         return parameters
 
     def synthetic_teacher_loss(
-        self, batch: dict[str, torch.Tensor], targets: tuple[torch.Tensor, ...], csm: torch.Tensor
+        self,
+        batch: DelicsRadialBatch,
+        targets: tuple[torch.Tensor, ...],
+        csm: torch.Tensor,
     ) -> torch.Tensor:
         """Average supervised losses over augmented synthetic teacher samples."""
         n_augmentations = self.hparams.teacher_augmentations_per_epoch
@@ -502,7 +489,10 @@ class FineTuneModule(BaseModule):
         return torch.stack(losses).mean()
 
     def _fine_tune_loss(
-        self, batch: dict[str, torch.Tensor], *, use_teacher: bool
+        self,
+        batch: DelicsRadialBatch,
+        *,
+        use_teacher: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute SSDU and optional teacher pseudo-reference losses."""
         _final_parameters, parameters, ssdu_loss = self._reconstruct_batch(batch)
@@ -532,7 +522,7 @@ class FineTuneModule(BaseModule):
         )
         return loss, components
 
-    def training_step(self, batch: dict[str, torch.Tensor], _batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: DelicsRadialBatch, _batch_idx: int) -> torch.Tensor:
         """Run one fine-tuning step."""
         loss, components = self._fine_tune_loss(batch, use_teacher=True)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -540,9 +530,3 @@ class FineTuneModule(BaseModule):
         if self.hparams.teacher_loss_weight:
             self.log('train/teacher_loss', components['teacher'].detach(), on_step=True, on_epoch=True, sync_dist=True)
         return loss
-
-    def validation_step(self, batch: dict[str, torch.Tensor], _batch_idx: int) -> None:
-        """Run one fine-tuning validation step."""
-        loss, components = self._fine_tune_loss(batch, use_teacher=False)
-        self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val/ssdu_loss', components['ssdu'].detach(), on_step=False, on_epoch=True, sync_dist=True)

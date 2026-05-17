@@ -20,7 +20,7 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.cli import LightningArgumentParser, LightningCLI
 from lightning.pytorch.loggers import WandbLogger
 
-from pinqi_mrf.data import DataModule, DelicsRadialDataModule
+from pinqi_mrf.data import FineTuneDataModule, PretrainDataModule
 from pinqi_mrf.finetune import FineTuneModule
 from pinqi_mrf.pretrain import PretrainModule
 from pinqi_mrf.train import LogLambdasCallback
@@ -36,8 +36,8 @@ class PinqiLightningCLI(LightningCLI):
     """LightningCLI with PINQI-MRF experiment defaults."""
 
     command_classes: ClassVar[dict[str, tuple[type[pl.LightningModule], type[pl.LightningDataModule]]]] = {
-        'pretrain': (PretrainModule, DataModule),
-        'finetune': (FineTuneModule, DelicsRadialDataModule),
+        'pretrain': (PretrainModule, PretrainDataModule),
+        'finetune': (FineTuneModule, FineTuneDataModule),
     }
     fit_skip: ClassVar[set[str]] = {'model', 'train_dataloaders', 'val_dataloaders', 'datamodule'}
 
@@ -107,11 +107,12 @@ class PinqiLightningCLI(LightningCLI):
         checkpoint_callback: ModelCheckpoint
         if self.subcommand == 'pretrain':
             checkpoint_callback = ModelCheckpoint(
-                monitor='val/loss',
+                monitor='val_0/loss',
                 mode='min',
                 save_top_k=2,
                 dirpath=str(run_dir),
-                filename='{epoch:02d}-{val/loss:.4f}',
+                filename='{epoch:02d}-{step:06d}',
+                auto_insert_metric_name=False,
                 save_last=True,
                 save_on_train_epoch_end=False,
             )
@@ -178,7 +179,7 @@ def main() -> None:
     """Run the CLI."""
     PinqiLightningCLI(
         PretrainModule,
-        DataModule,
+        PretrainDataModule,
         trainer_class=PinqiTrainer,
         save_config_kwargs={'overwrite': True},
         seed_everything_default=42,

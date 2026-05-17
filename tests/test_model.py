@@ -137,3 +137,20 @@ def test_teacher_parameter_loss_uses_mask(monkeypatch: pytest.MonkeyPatch) -> No
     loss = module.teacher_parameter_loss([prediction], target, mask)
 
     torch.testing.assert_close(loss, torch.tensor(4.0))
+
+
+def test_input_normalization_uses_coefficient_norm_percentile() -> None:
+    """Coefficient-space input normalization uses the robust voxelwise coefficient norm."""
+    signal = torch.tensor(
+        [
+            [
+                [[[[1.0 + 0j, 2.0 + 0j]]]],
+                [[[[3.0 + 0j, 4.0 + 0j]]]],
+            ]
+        ],
+        dtype=torch.complex64,
+    )
+    scale = PINQI.estimate_input_scale(signal)
+    coefficient_norm = torch.linalg.vector_norm(signal, dim=1).reshape(1, -1)
+    expected_scale = torch.quantile(coefficient_norm, 0.95, dim=1)
+    torch.testing.assert_close(scale, expected_scale)

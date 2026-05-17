@@ -46,6 +46,7 @@ class PINQI(torch.nn.Module):
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         nonlinear_solver_batch_size: int = 8192,
         weight_scaling: bool = False,
+        normalize_inputs: bool = False,
     ) -> None:
         """Initialize the model."""
         super().__init__()
@@ -85,6 +86,7 @@ class PINQI(torch.nn.Module):
         self.lambdas_raw = torch.nn.Parameter(lambdas_raw)
         self.softplus = torch.nn.Softplus(beta=5)
         self.weight_scaling = weight_scaling
+        self.normalize_inputs = normalize_inputs
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
         self.nonlinear_solver = mr2.operators.DifferentiableDictionaryMatchOp(
             self.signalmodel,
@@ -200,6 +202,14 @@ class PINQI(torch.nn.Module):
             return rhs, normal_op
         return rhs / weight_scale, weight_scale.reciprocal() * normal_op
 
+    @staticmethod
+    def estimate_input_scale(signal: torch.Tensor) -> torch.Tensor:
+        """Estimate a robust per-sample image scale from coefficient images."""
+        coefficient_norm = torch.linalg.vector_norm(signal, dim=1)
+        flattened_norm = coefficient_norm.flatten(start_dim=1)
+        scale = torch.quantile(flattened_norm, 0.95, dim=1)
+        return scale.clamp_min(1e-8)
+
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> ParameterTuple:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
@@ -248,6 +258,11 @@ class PINQI(torch.nn.Module):
                 max_iterations=self.config.initial_cg_iterations,
             )
         )
+        if self.normalize_inputs:
+            input_scale = self.estimate_input_scale(images[-1]).reciprocal()
+            coil_rhs = coil_rhs * mr2.utils.unsqueeze_at(input_scale, dim=1, n=coil_rhs.ndim - 1)
+            rhs = rhs * mr2.utils.unsqueeze_at(input_scale, dim=1, n=rhs.ndim - 1)
+            images = [image * mr2.utils.unsqueeze_at(input_scale, dim=1, n=image.ndim - 1) for image in images]
         signal = images[-1]
         parameters: list[ParameterTuple] = []
         linear_solver = self.get_linear_solver(normal_op)
