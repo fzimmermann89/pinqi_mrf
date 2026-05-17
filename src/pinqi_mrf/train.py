@@ -1,6 +1,7 @@
 """Shared training infrastructure for PINQI-MRF Lightning modules."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -14,8 +15,15 @@ import torch
 from matplotlib.colors import Colormap
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
-from pinqi_mrf.acquisition import create_radial_trajectory
-from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxation_time
+from pinqi_mrf.acquisition import AcquisitionData, create_radial_trajectory
+from pinqi_mrf.data import BatchType, DelicsRadialReferenceBatch, ValidationLoaderType
+from pinqi_mrf.losses import ssim_loss
+from pinqi_mrf.parameters import (
+    R1_STATS,
+    R2_STATS,
+    relaxation_time_to_standardized_rate,
+    standardized_rate_to_relaxation_time,
+)
 from pinqi_mrf.pinqi import PINQI, BaselineReconstruction, ParameterTuple
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
@@ -24,6 +32,41 @@ MIN_SUPERVISED_T1 = 0.5
 MIN_SUPERVISED_T2 = 0.03
 T1_DISPLAY_RANGE = (0.0, 2.0)
 T2_DISPLAY_RANGE = (0.020, 0.150)
+
+
+@dataclass
+class RelaxationTimeValidationResult:
+    """Validation metrics and maps for one relaxation-time map."""
+
+    target: torch.Tensor
+    baseline: torch.Tensor
+    prediction: torch.Tensor
+    rmse: torch.Tensor
+    baseline_rmse: torch.Tensor
+    ssim: torch.Tensor
+    baseline_ssim: torch.Tensor
+
+
+@dataclass
+class ParameterValidationResult:
+    """Shared parameter-validation outputs used for logging and figures."""
+
+    t1: RelaxationTimeValidationResult
+    t2: RelaxationTimeValidationResult
+    metric_mask: torch.Tensor
+
+
+@dataclass
+class ValidationFigureData:
+    """Cached validation outputs for epoch-end figure logging."""
+
+    target_t1: torch.Tensor
+    baseline_t1: torch.Tensor
+    prediction_t1: torch.Tensor
+    target_t2: torch.Tensor
+    baseline_t2: torch.Tensor
+    prediction_t2: torch.Tensor
+    mask: torch.Tensor
 
 
 class PretrainHParams(Protocol):
@@ -37,6 +80,7 @@ class PretrainHParams(Protocol):
     csm_extrapolate: bool
     use_density_compensation: bool
     weight_scaling: bool
+    normalize_inputs: bool
     lr: float
     weight_decay: float
     loss_weights: Sequence[float]
@@ -74,8 +118,9 @@ class BaseModule(pl.LightningModule):
         parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
-        use_density_compensation: bool = True,  # noqa: ARG002
+        use_density_compensation: bool = False,  # noqa: ARG002
         weight_scaling: bool = False,
+        normalize_inputs: bool = False,
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,  # noqa: ARG002
         csm_estimation_iterations: int = 10,  # noqa: ARG002
@@ -136,13 +181,14 @@ class BaseModule(pl.LightningModule):
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
             weight_scaling=weight_scaling,
+            normalize_inputs=normalize_inputs,
         )
         self.baseline = BaselineReconstruction(
             signalmodel=self.signalmodel,
             parameter_ranges=parameter_ranges,
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
         )
-        self.validation_step_outputs: dict[str, torch.Tensor] = {}
+        self.validation_step_outputs: dict[str, ValidationFigureData] = {}
         self.subspace_gram: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.subspace_gram_scale: torch.Tensor | None = None
         self.noise_sampler: WhiteKspaceSubspaceRhsNoiseSampler | None = None
@@ -259,6 +305,145 @@ class BaseModule(pl.LightningModule):
         csm_initial = csm_initial if csm_initial is not None else self.estimate_initial_csm(coil_rhs)
         return self.pinqi(coil_rhs, csm_initial, self.subspace_gram, weight_scale=self.subspace_gram_scale)
 
+    def simulate_coil_rhs(self, batch: BatchType) -> tuple[torch.Tensor, torch.Tensor]:
+        """Simulate compressed coilwise subspace RHS data from synthetic maps."""
+        if self.subspace_gram is None or self.noise_sampler is None:
+            raise RuntimeError('Acquisition operators have not been initialized.')
+
+        (coefficients,) = self.signalmodel(*self._parameters_from_batch(batch))
+        coefficients = coefficients.movedim(0, 1)
+        csm_op = mr2.operators.SensitivityOp(batch['csm'][:, None])
+        (coil_coefficients,) = csm_op(coefficients)
+        (coil_rhs,) = self.subspace_gram(coil_coefficients)
+        coil_rhs = coil_rhs + self.noise_sampler(batch['noise_std'])
+        return self.compress_coils(coil_rhs, batch['csm'])
+
+    def supervised_parameter_loss(
+        self,
+        predictions: Sequence[ParameterTuple],
+        batch: BatchType,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute supervised synthetic parameter loss in standardized parameter space."""
+        components = {
+            'base': torch.tensor(0.0, device=self.device),
+            'l1': torch.tensor(0.0, device=self.device),
+            'ssim': torch.tensor(0.0, device=self.device),
+        }
+        target_parameters = self._parameters_from_batch(batch)
+        if len(target_parameters) < 3:
+            raise RuntimeError('Synthetic supervision currently expects at least m0, r1, and r2 target parameters.')
+        target_r1 = target_parameters[1]
+        target_r2 = target_parameters[2]
+        mask = batch['mask'].bool()
+        target_t1 = standardized_rate_to_relaxation_time(target_r1, R1_STATS)
+        target_t2 = standardized_rate_to_relaxation_time(target_r2, R2_STATS)
+        parameter_mask = self._parameter_mask(mask, target_r1, target_r2, target_t1, target_t2)
+        final_iteration = len(predictions) - 1
+        for iteration, (prediction, weight) in enumerate(zip(predictions, self.hparams.loss_weights, strict=True)):
+            prediction_parameters = tuple(parameter.squeeze(1, 2) for parameter in prediction)
+            parameter_losses = []
+            for target_index, (prediction_parameter, target_parameter) in enumerate(
+                zip(prediction_parameters, target_parameters, strict=True)
+            ):
+                if torch.is_complex(target_parameter):
+                    parameter_loss = torch.nn.functional.mse_loss(
+                        torch.view_as_real(prediction_parameter[parameter_mask]),
+                        torch.view_as_real(target_parameter.to(prediction_parameter.dtype)[parameter_mask]),
+                    )
+                else:
+                    parameter_loss = torch.nn.functional.mse_loss(
+                        prediction_parameter[parameter_mask],
+                        target_parameter[parameter_mask],
+                    )
+                parameter_losses.append(0.5 * parameter_loss if target_index == 0 else parameter_loss)
+            loss_outside = prediction_parameters[0][~mask].abs().mean()
+            components['base'] = components['base'] + weight * (
+                sum(parameter_losses, start=torch.zeros((), device=self.device)) + 0.1 * loss_outside
+            )
+            if iteration == final_iteration:
+                component_names = ('m0', 'r1', 'r2')
+                for parameter_index, parameter_loss in enumerate(parameter_losses):
+                    name = (
+                        component_names[parameter_index]
+                        if parameter_index < len(component_names)
+                        else f'param{parameter_index}'
+                    )
+                    components[name] = parameter_loss * 2 if parameter_index == 0 else parameter_loss
+                components['outside'] = loss_outside
+        if self.hparams.loss_l1 or self.hparams.loss_ssim:
+            target_quantitative_parameters = tuple(target[:, None, None] for target in target_parameters[1:])
+            prediction_quantitative_parameters = predictions[-1][1:]
+            if self.hparams.loss_l1:
+                losses_l1 = (
+                    torch.nn.functional.l1_loss(
+                        prediction.squeeze(1, 2)[parameter_mask],
+                        target.squeeze(1, 2)[parameter_mask],
+                    )
+                    for prediction, target in zip(
+                        prediction_quantitative_parameters,
+                        target_quantitative_parameters,
+                        strict=True,
+                    )
+                )
+                components['l1'] = sum(losses_l1, start=torch.tensor(0.0, device=self.device))
+            if self.hparams.loss_ssim:
+                components['ssim'] = ssim_loss(
+                    prediction_quantitative_parameters,
+                    target_quantitative_parameters,
+                    parameter_mask,
+                )
+        loss = (
+            components['base'] + self.hparams.loss_l1 * components['l1'] + self.hparams.loss_ssim * components['ssim']
+        )
+        return loss, components
+
+    @staticmethod
+    def _parameters_from_batch(batch: BatchType) -> ParameterTuple:
+        """Extract the ordered parameter tuple from a synthetic batch."""
+        return (batch['m0'], batch['r1'], batch['r2'])
+
+    def build_coil_rhs(
+        self,
+        kspace: torch.Tensor,
+        acquisition: AcquisitionData,
+        subspace_basis: torch.Tensor,
+        nufft: mr2.operators.NonUniformFastFourierOp,
+    ) -> torch.Tensor:
+        """Build coilwise subspace RHS for a selected acquisition."""
+        if self.hparams.use_density_compensation:
+            (kspace,) = acquisition.dcf.as_operator()(kspace)
+        (coil_time_images,) = nufft.H(kspace)
+        return einops.einsum(
+            subspace_basis.conj(),
+            coil_time_images,
+            'time coeff, batch time coil z y x -> batch coeff coil z y x',
+        )
+
+    def reconstruct_full_kspace(
+        self,
+        kspace: torch.Tensor,
+    ) -> tuple[ParameterTuple, ParameterTuple]:
+        """Reconstruct PINQI and baseline parameter maps from full k-space."""
+        if self.subspace_gram is None:
+            raise RuntimeError('Acquisition operators have not been initialized.')
+        acquisition = self.acquisition.to(self.device)
+        subspace_basis = self.signalmodel.pca.compression_matrix.mH
+        if subspace_basis.ndim > 2:
+            subspace_basis = subspace_basis.squeeze(tuple(range(subspace_basis.ndim - 2)))
+        nufft = mr2.operators.NonUniformFastFourierOp(
+            direction=(-2, -1),
+            recon_matrix=self.matrix_size,
+            encoding_matrix=self.matrix_size,
+            traj=acquisition.trajectory,
+        )
+        coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft)
+        csm_initial = self.estimate_initial_csm(coil_rhs)
+        rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
+        rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
+        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        baseline_parameters = self.baseline(rhs, normal_op)
+        return parameters[-1], baseline_parameters
+
     def log_csm_diagnostics(self, csm: torch.Tensor, prefix: str) -> None:
         """Log coil-wise CSM normalization diagnostics."""
         norm = csm.abs().square().sum(dim=1).sqrt()
@@ -279,23 +464,309 @@ class BaseModule(pl.LightningModule):
         """Log validation images."""
         if not self.trainer.is_global_zero or not self.validation_step_outputs:
             return
-        self._log_relaxation_time_figure(
-            't1',
-            'r1',
-            R1_STATS,
-            '$T_1$ [s]',
-            T1_DISPLAY_RANGE,
-            cmap.Colormap('lipari').to_mpl(),
-        )
-        self._log_relaxation_time_figure(
-            't2',
-            'r2',
-            R2_STATS,
-            '$T_2$ [s]',
-            T2_DISPLAY_RANGE,
-            cmap.Colormap('navia').to_mpl(),
-        )
+        for loader_id, outputs in self.validation_step_outputs.items():
+            self._log_relaxation_time_figure(
+                loader_id,
+                outputs.target_t1,
+                outputs.baseline_t1,
+                outputs.prediction_t1,
+                outputs.mask,
+                't1',
+                '$T_1$ [s]',
+                T1_DISPLAY_RANGE,
+                cmap.Colormap('lipari').to_mpl(),
+            )
+            self._log_relaxation_time_figure(
+                loader_id,
+                outputs.target_t2,
+                outputs.baseline_t2,
+                outputs.prediction_t2,
+                outputs.mask,
+                't2',
+                '$T_2$ [s]',
+                T2_DISPLAY_RANGE,
+                cmap.Colormap('navia').to_mpl(),
+            )
         self.validation_step_outputs.clear()
+
+    def _evaluate_relaxation_time_validation(
+        self,
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        prediction: torch.Tensor,
+        metric_mask: torch.Tensor,
+        display_range: tuple[float, float],
+        *,
+        clip_to_target_range: bool = False,
+    ) -> RelaxationTimeValidationResult:
+        """Evaluate one relaxation-time map against a reference."""
+        target_map = target.squeeze(1, 2)
+        baseline_map = baseline.squeeze(1, 2)
+        prediction_map = prediction.squeeze(1, 2)
+        if clip_to_target_range:
+            target_min = target_map.masked_fill(~metric_mask, torch.inf).flatten(start_dim=1).amin(dim=1)
+            target_max = target_map.masked_fill(~metric_mask, -torch.inf).flatten(start_dim=1).amax(dim=1)
+            target_min = mr2.utils.unsqueeze_at(target_min, dim=1, n=target_map.ndim - 1)
+            target_max = mr2.utils.unsqueeze_at(target_max, dim=1, n=target_map.ndim - 1)
+            prediction_map = prediction_map.clamp(min=target_min, max=target_max)
+            baseline_map = baseline_map.clamp(min=target_min, max=target_max)
+        target_masked = target_map[metric_mask]
+        baseline_masked = baseline_map[metric_mask]
+        prediction_masked = prediction_map[metric_mask]
+        target_ssim = target_map.clamp(*display_range)
+        baseline_ssim = baseline_map.clamp(*display_range)
+        prediction_ssim = prediction_map.clamp(*display_range)
+        target_ssim = torch.where(metric_mask[:, None, None], target_ssim, torch.zeros_like(target_ssim))
+        baseline_ssim = torch.where(metric_mask[:, None, None], baseline_ssim, torch.zeros_like(baseline_ssim))
+        prediction_ssim = torch.where(metric_mask[:, None, None], prediction_ssim, torch.zeros_like(prediction_ssim))
+        data_range = torch.tensor(display_range[1] - display_range[0], device=self.device)
+        (ssim,) = mr2.operators.functionals.SSIM(target_ssim, metric_mask, data_range=data_range)(prediction_ssim)
+        (baseline_ssim_value,) = mr2.operators.functionals.SSIM(
+            target_ssim,
+            metric_mask,
+            data_range=data_range,
+        )(baseline_ssim)
+        return RelaxationTimeValidationResult(
+            target=target,
+            baseline=baseline,
+            prediction=prediction,
+            rmse=torch.sqrt(torch.nn.functional.mse_loss(prediction_masked, target_masked)),
+            baseline_rmse=torch.sqrt(torch.nn.functional.mse_loss(baseline_masked, target_masked)),
+            ssim=ssim,
+            baseline_ssim=baseline_ssim_value,
+        )
+
+    def evaluate_parameter_validation(
+        self,
+        prediction_parameters: ParameterTuple,
+        baseline_parameters: ParameterTuple,
+        mask: torch.Tensor,
+        reference_t1: torch.Tensor,
+        reference_t2: torch.Tensor,
+        *,
+        clip_to_target_range: bool = False,
+    ) -> ParameterValidationResult:
+        """Evaluate reconstruction quality against reference T1/T2 maps."""
+        if len(prediction_parameters) < 3 or len(baseline_parameters) < 3:
+            raise RuntimeError('Validation currently expects at least m0, r1, and r2 reconstruction outputs.')
+        target_t1 = reference_t1
+        target_t2 = reference_t2
+        target_r1 = relaxation_time_to_standardized_rate(target_t1, R1_STATS)
+        target_r2 = relaxation_time_to_standardized_rate(target_t2, R2_STATS)
+
+        pred_t1 = standardized_rate_to_relaxation_time(prediction_parameters[1], R1_STATS)
+        pred_t2 = standardized_rate_to_relaxation_time(prediction_parameters[2], R2_STATS)
+        baseline_t1 = standardized_rate_to_relaxation_time(baseline_parameters[1], R1_STATS)
+        baseline_t2 = standardized_rate_to_relaxation_time(baseline_parameters[2], R2_STATS)
+
+        target_r1_map = target_r1.squeeze(1, 2)
+        target_r2_map = target_r2.squeeze(1, 2)
+        target_t1_map = target_t1.squeeze(1, 2)
+        target_t2_map = target_t2.squeeze(1, 2)
+        metric_mask = self._parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
+        return ParameterValidationResult(
+            t1=self._evaluate_relaxation_time_validation(
+                target_t1,
+                baseline_t1,
+                pred_t1,
+                metric_mask,
+                T1_DISPLAY_RANGE,
+                clip_to_target_range=clip_to_target_range,
+            ),
+            t2=self._evaluate_relaxation_time_validation(
+                target_t2,
+                baseline_t2,
+                pred_t2,
+                metric_mask,
+                T2_DISPLAY_RANGE,
+                clip_to_target_range=clip_to_target_range,
+            ),
+            metric_mask=metric_mask,
+        )
+
+    def log_parameter_validation(
+        self,
+        prefix: str,
+        result: ParameterValidationResult,
+        *,
+        batch_size: int,
+        prog_bar: bool = False,
+    ) -> None:
+        """Log common parameter-validation metrics for one validation loader."""
+        self.log(
+            f'{prefix}/ssim_t1',
+            result.t1.ssim,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(f'{prefix}/rmse_t1', result.t1.rmse, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log(
+            f'{prefix}/ssim_t1_baseline',
+            result.t1.baseline_ssim,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            f'{prefix}/rmse_t1_baseline',
+            result.t1.baseline_rmse,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(f'{prefix}/ssim_t2', result.t2.ssim, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log(f'{prefix}/rmse_t2', result.t2.rmse, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log(
+            f'{prefix}/ssim_t2_baseline',
+            result.t2.baseline_ssim,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            f'{prefix}/rmse_t2_baseline',
+            result.t2.baseline_rmse,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+    def _store_validation_images(
+        self,
+        loader_id: str,
+        result: ParameterValidationResult,
+        mask: torch.Tensor,
+    ) -> None:
+        """Store one validation batch for epoch-end figure logging."""
+        self.validation_step_outputs[loader_id] = ValidationFigureData(
+            target_t1=result.t1.target.detach().cpu(),
+            baseline_t1=result.t1.baseline.detach().cpu(),
+            prediction_t1=result.t1.prediction.detach().cpu(),
+            target_t2=result.t2.target.detach().cpu(),
+            baseline_t2=result.t2.baseline.detach().cpu(),
+            prediction_t2=result.t2.prediction.detach().cpu(),
+            mask=mask.detach().cpu(),
+        )
+
+    def _synthetic_validation_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int) -> None:
+        """Run one synthetic validation step."""
+        coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
+        csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
+        if batch_idx == 0:
+            self.log_csm_diagnostics(csm_initial, prefix='debug/val_csm')
+        if self.subspace_gram is None:
+            raise RuntimeError('Acquisition operators have not been initialized.')
+        rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
+        rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
+        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        loss, components = self.supervised_parameter_loss(parameters, batch)
+        prediction_parameters = parameters[-1]
+        baseline_parameters = self.baseline(rhs, normal_op)
+        mask = batch['mask'].bool()
+        batch_size = len(mask)
+        target_t1 = standardized_rate_to_relaxation_time(batch['r1'][:, None, None], R1_STATS)
+        target_t2 = standardized_rate_to_relaxation_time(batch['r2'][:, None, None], R2_STATS)
+        prefix = f'val_{dataloader_idx}'
+        result = self.evaluate_parameter_validation(
+            prediction_parameters,
+            baseline_parameters,
+            mask,
+            target_t1,
+            target_t2,
+        )
+        metric_mask = result.metric_mask
+        pred_t2_masked = result.t2.prediction.squeeze(1, 2)[metric_mask]
+        baseline_t2_masked = result.t2.baseline.squeeze(1, 2)[metric_mask]
+        target_t2_masked = result.t2.target.squeeze(1, 2)[metric_mask]
+        pred_r2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
+        pred_r2_rate_masked = pred_r2_masked * R2_STATS[1] + R2_STATS[0]
+        self.log_parameter_validation(prefix, result, batch_size=batch_size)
+        self.log(f'{prefix}/loss', loss, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log_dict(
+            {f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(f'{prefix}/debug/pred_t2_abs_max', pred_t2_masked.abs().amax(), on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/debug/pred_t2_min', pred_t2_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log(
+            f'{prefix}/debug/pred_t2_p99',
+            torch.quantile(pred_t2_masked, 0.99),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            f'{prefix}/debug/baseline_t2_abs_max',
+            baseline_t2_masked.abs().amax(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(f'{prefix}/debug/target_t2_abs_max', target_t2_masked.abs().amax(), on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/debug/pred_r2_min', pred_r2_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log(f'{prefix}/debug/pred_r2_rate_min', pred_r2_rate_masked.amin(), on_epoch=True, sync_dist=True)
+        self.log(
+            f'{prefix}/debug/pred_t2_invalid_fraction',
+            (~torch.isfinite(pred_t2_masked)).float().mean(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            f'{prefix}/debug/pred_t2_gt_display_max_fraction',
+            (pred_t2_masked > T2_DISPLAY_RANGE[1]).float().mean(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        if batch_idx == 0 and self.trainer.is_global_zero:
+            self._store_validation_images(prefix, result, mask)
+
+    def _kspace_validation_step(
+        self,
+        batch: DelicsRadialReferenceBatch,
+        batch_idx: int,
+        dataloader_idx: int,
+    ) -> None:
+        """Run one full-k-space validation step."""
+        prediction_parameters, baseline_parameters = self.reconstruct_full_kspace(batch['kspace'])
+        mask = batch['mask'].to(self.device).bool()
+        prefix = f'val_{dataloader_idx}'
+        result = self.evaluate_parameter_validation(
+            prediction_parameters,
+            baseline_parameters,
+            mask,
+            batch['reference_t1'].to(self.device)[:, None, None],
+            batch['reference_t2'].to(self.device)[:, None, None],
+            clip_to_target_range=True,
+        )
+        self.log_parameter_validation(prefix, result, batch_size=len(mask), prog_bar=True)
+        if batch_idx == 0 and self.trainer.is_global_zero:
+            self._store_validation_images(prefix, result, mask)
+
+    def validation_loader_type(self, dataloader_idx: int) -> ValidationLoaderType:
+        """Return the validation loader type for the active datamodule."""
+        datamodule = self.trainer.datamodule
+        if datamodule is None or not hasattr(datamodule, 'validation_loader_types'):
+            raise RuntimeError('Validation requires a datamodule with validation_loader_types.')
+        loader_types = tuple(datamodule.validation_loader_types)
+        return loader_types[dataloader_idx]
+
+    def validation_step(
+        self,
+        batch: BatchType | DelicsRadialReferenceBatch,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        """Run one explicit validation step for the configured validation loaders."""
+        match self.validation_loader_type(dataloader_idx):
+            case ValidationLoaderType.SYNTHETIC:
+                self._synthetic_validation_step(batch, batch_idx, dataloader_idx)
+            case ValidationLoaderType.KSPACE:
+                self._kspace_validation_step(batch, batch_idx, dataloader_idx)
+            case _:
+                raise ValueError(f'Unknown validation loader type at index {dataloader_idx}.')
 
     @staticmethod
     def _parameter_mask(
@@ -318,24 +789,26 @@ class BaseModule(pl.LightningModule):
 
     def _log_relaxation_time_figure(
         self,
-        relaxation_name: str,
-        rate_name: str,
-        stats: tuple[float, float],
+        loader_id: str,
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        prediction: torch.Tensor,
+        mask: torch.Tensor,
+        name: str,
         label: str,
         value_range: tuple[float, float],
         colormap: Colormap,
     ) -> None:
         """Log one parameter figure to W&B."""
-        outputs = self.validation_step_outputs
-        samples = len(outputs['mask'])
+        samples = len(mask)
         vmin, vmax = value_range
         fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
         for sample in range(samples):
             self.result_plot(
-                standardized_rate_to_relaxation_time(outputs[f'target_{rate_name}'][sample], stats),
-                standardized_rate_to_relaxation_time(outputs[f'baseline_{rate_name}'][sample], stats),
-                standardized_rate_to_relaxation_time(outputs[f'pred_{rate_name}'][sample], stats),
-                outputs['mask'][sample],
+                target[sample],
+                baseline[sample],
+                prediction[sample],
+                mask[sample],
                 axes[:, sample],
                 label,
                 vmin=vmin,
@@ -343,7 +816,7 @@ class BaseModule(pl.LightningModule):
                 cmap=colormap,
             )
         fig.suptitle(f'{label} Epoch {self.current_epoch}')
-        self.logger.experiment.log({f'val/images/{relaxation_name}': fig})
+        self.logger.experiment.log({f'val_{loader_id}/images/{name}': fig})
         plt.close(fig)
 
     @staticmethod
