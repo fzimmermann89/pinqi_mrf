@@ -119,8 +119,8 @@ class BaseModule(pl.LightningModule):
         parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         trajectory: str = 'radial',
         use_density_compensation: bool = False,  # noqa: ARG002
-        weight_scaling: bool = False,
-        normalize_inputs: bool = False,
+        weight_scaling: bool = True,
+        normalize_inputs: bool = True,
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,  # noqa: ARG002
         csm_estimation_iterations: int = 10,  # noqa: ARG002
@@ -140,7 +140,7 @@ class BaseModule(pl.LightningModule):
         lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
         loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
-        loss_l1: float = 0.0,  # noqa: ARG002
+        loss_l1: float = 0.1,  # noqa: ARG002
         loss_ssim: float = 0.0,  # noqa: ARG002
     ) -> None:
         """Initialize the shared reconstruction state."""
