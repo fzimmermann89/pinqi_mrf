@@ -34,6 +34,7 @@ def create_small_finetune_module(**kwargs: object) -> FineTuneModule:
         image_size=8,
         n_readout_samples=8,
         n_coils=2,
+        n_compressed_coils=2,
         n_timepoints=2,
         parameter_ranges=((-0.5, 0.5, 4), (-0.5, 0.5, 4)),
         n_iterations=1,
