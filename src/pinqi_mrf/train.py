@@ -513,12 +513,13 @@ class BaseModule(pl.LightningModule):
         target_masked = target_map[metric_mask]
         baseline_masked = baseline_map[metric_mask]
         prediction_masked = prediction_map[metric_mask]
-        target_ssim = target_map.clamp(*display_range)
-        baseline_ssim = baseline_map.clamp(*display_range)
-        prediction_ssim = prediction_map.clamp(*display_range)
-        target_ssim = torch.where(metric_mask[:, None, None], target_ssim, torch.zeros_like(target_ssim))
-        baseline_ssim = torch.where(metric_mask[:, None, None], baseline_ssim, torch.zeros_like(baseline_ssim))
-        prediction_ssim = torch.where(metric_mask[:, None, None], prediction_ssim, torch.zeros_like(prediction_ssim))
+        metric_mask_ssim = metric_mask[:, None]
+        target_ssim = target_map.clamp(*display_range)[:, None]
+        baseline_ssim = baseline_map.clamp(*display_range)[:, None]
+        prediction_ssim = prediction_map.clamp(*display_range)[:, None]
+        target_ssim = torch.where(metric_mask_ssim, target_ssim, torch.zeros_like(target_ssim))
+        baseline_ssim = torch.where(metric_mask_ssim, baseline_ssim, torch.zeros_like(baseline_ssim))
+        prediction_ssim = torch.where(metric_mask_ssim, prediction_ssim, torch.zeros_like(prediction_ssim))
         data_range = torch.tensor(display_range[1] - display_range[0], device=self.device)
         (ssim,) = mr2.operators.functionals.SSIM(target_ssim, metric_mask, data_range=data_range)(prediction_ssim)
         (baseline_ssim_value,) = mr2.operators.functionals.SSIM(
