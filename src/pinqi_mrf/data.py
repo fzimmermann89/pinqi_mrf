@@ -28,6 +28,7 @@ BRAINWEB_VALUES_3T_RANDOMIZED = {
     'ves': mr2.phantoms.brainweb.BrainwebTissue((1.700, 2.100), (0.200, 0.400), (0.80, 1.00), (-0.2, 0.2)),
 }
 
+
 class BatchType(TypedDict):
     """Type hint for a batch of data."""
 
@@ -109,12 +110,6 @@ class DelicsRadialDataset(
         include_references: IncludeReferences = False,
     ) -> None:
         """Initialize the DELICS radial dataset."""
-        if delics_scale <= 0:
-            raise ValueError('delics_scale must be positive.')
-        if delics_noise_std < 0:
-            raise ValueError('delics_noise_std must be non-negative.')
-        if any(trim < 0 for trim in slice_trim):
-            raise ValueError('slice_trim entries must be non-negative.')
         self.folder = folder
         self.case_glob = case_glob
         self.delics_scale = delics_scale
@@ -455,7 +450,7 @@ class DataModule(pl.LightningDataModule):
                 self.delics_folder,
                 case_glob=self.delics_case_glob,
                 case_ids=self.delics_val_case_ids,
-                slice_trim=(5, 1),
+                slice_trim=(0, 0),
                 include_references=True,
             )
 
@@ -607,7 +602,7 @@ class FineTuneDataModule(DataModule):
                 self.delics_folder,
                 case_glob=self.delics_case_glob,
                 case_ids=self.train_case_ids,
-                slice_trim=(4, 0),
+                slice_trim=(0, 0),
                 include_references=False,
             )
 
