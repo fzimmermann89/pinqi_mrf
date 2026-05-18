@@ -17,7 +17,7 @@ import lightning.pytorch as pl
 import matplotlib
 import torch
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.cli import LightningArgumentParser, LightningCLI
+from lightning.pytorch.cli import LightningArgumentParser, LightningCLI, SaveConfigCallback
 from lightning.pytorch.loggers import WandbLogger
 
 from pinqi_mrf.data import FineTuneDataModule, PretrainDataModule
@@ -30,6 +30,25 @@ torch.set_num_threads(4)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+class CheckpointDirSaveConfigCallback(SaveConfigCallback):
+    """Also save the effective CLI config in the checkpoint directory."""
+
+    def save_config(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
+        """Save the config next to checkpoints for reproducible resume commands."""
+        _ = pl_module, stage
+        if trainer.default_root_dir is None:
+            return
+        config_path = Path(trainer.default_root_dir) / self.config_filename
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.parser.save(
+            self.config,
+            config_path,
+            skip_none=False,
+            overwrite=self.overwrite,
+            multifile=self.multifile,
+        )
 
 
 class PinqiLightningCLI(LightningCLI):
@@ -181,6 +200,7 @@ def main() -> None:
         PretrainModule,
         PretrainDataModule,
         trainer_class=PinqiTrainer,
+        save_config_callback=CheckpointDirSaveConfigCallback,
         save_config_kwargs={'overwrite': True},
         seed_everything_default=42,
         trainer_defaults={
