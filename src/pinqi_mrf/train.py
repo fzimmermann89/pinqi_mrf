@@ -458,6 +458,7 @@ class BaseModule(pl.LightningModule):
             on_step=self.training,
             on_epoch=not self.training,
             sync_dist=True,
+            add_dataloader_idx=False,
         )
 
     def on_validation_epoch_end(self) -> None:
@@ -594,44 +595,22 @@ class BaseModule(pl.LightningModule):
         prog_bar: bool = False,
     ) -> None:
         """Log common parameter-validation metrics for one validation loader."""
-        self.log(
-            f'{prefix}/ssim_t1',
-            result.t1.ssim,
+        self.log_dict(
+            {
+                f'{prefix}/ssim_t1': result.t1.ssim,
+                f'{prefix}/rmse_t1': result.t1.rmse,
+                f'{prefix}/ssim_t1_baseline': result.t1.baseline_ssim,
+                f'{prefix}/rmse_t1_baseline': result.t1.baseline_rmse,
+                f'{prefix}/ssim_t2': result.t2.ssim,
+                f'{prefix}/rmse_t2': result.t2.rmse,
+                f'{prefix}/ssim_t2_baseline': result.t2.baseline_ssim,
+                f'{prefix}/rmse_t2_baseline': result.t2.baseline_rmse,
+            },
             on_epoch=True,
             prog_bar=prog_bar,
             sync_dist=True,
             batch_size=batch_size,
-        )
-        self.log(f'{prefix}/rmse_t1', result.t1.rmse, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(
-            f'{prefix}/ssim_t1_baseline',
-            result.t1.baseline_ssim,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            f'{prefix}/rmse_t1_baseline',
-            result.t1.baseline_rmse,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch_size,
-        )
-        self.log(f'{prefix}/ssim_t2', result.t2.ssim, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(f'{prefix}/rmse_t2', result.t2.rmse, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(
-            f'{prefix}/ssim_t2_baseline',
-            result.t2.baseline_ssim,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            f'{prefix}/rmse_t2_baseline',
-            result.t2.baseline_rmse,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch_size,
+            add_dataloader_idx=False,
         )
 
     def _store_validation_images(
@@ -684,41 +663,39 @@ class BaseModule(pl.LightningModule):
         pred_r2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
         pred_r2_rate_masked = pred_r2_masked * R2_STATS[1] + R2_STATS[0]
         self.log_parameter_validation(prefix, result, batch_size=batch_size)
-        self.log(f'{prefix}/loss', loss, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log(
+            f'{prefix}/loss',
+            loss,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+            add_dataloader_idx=False,
+        )
         self.log_dict(
             {f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
             on_epoch=True,
             sync_dist=True,
             batch_size=batch_size,
+            add_dataloader_idx=False,
         )
-        self.log(f'{prefix}/debug/pred_t2_abs_max', pred_t2_masked.abs().amax(), on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/debug/pred_t2_min', pred_t2_masked.amin(), on_epoch=True, sync_dist=True)
-        self.log(
-            f'{prefix}/debug/pred_t2_p99',
-            torch.quantile(pred_t2_masked, 0.99),
+        self.log_dict(
+            {
+                f'{prefix}/debug/pred_t2_abs_max': pred_t2_masked.abs().amax(),
+                f'{prefix}/debug/pred_t2_min': pred_t2_masked.amin(),
+                f'{prefix}/debug/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
+                f'{prefix}/debug/baseline_t2_abs_max': baseline_t2_masked.abs().amax(),
+                f'{prefix}/debug/target_t2_abs_max': target_t2_masked.abs().amax(),
+                f'{prefix}/debug/pred_r2_min': pred_r2_masked.amin(),
+                f'{prefix}/debug/pred_r2_rate_min': pred_r2_rate_masked.amin(),
+                f'{prefix}/debug/pred_t2_invalid_fraction': (~torch.isfinite(pred_t2_masked)).float().mean(),
+                f'{prefix}/debug/pred_t2_gt_display_max_fraction': (
+                    pred_t2_masked > T2_DISPLAY_RANGE[1]
+                ).float().mean(),
+            },
             on_epoch=True,
             sync_dist=True,
-        )
-        self.log(
-            f'{prefix}/debug/baseline_t2_abs_max',
-            baseline_t2_masked.abs().amax(),
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(f'{prefix}/debug/target_t2_abs_max', target_t2_masked.abs().amax(), on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/debug/pred_r2_min', pred_r2_masked.amin(), on_epoch=True, sync_dist=True)
-        self.log(f'{prefix}/debug/pred_r2_rate_min', pred_r2_rate_masked.amin(), on_epoch=True, sync_dist=True)
-        self.log(
-            f'{prefix}/debug/pred_t2_invalid_fraction',
-            (~torch.isfinite(pred_t2_masked)).float().mean(),
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            f'{prefix}/debug/pred_t2_gt_display_max_fraction',
-            (pred_t2_masked > T2_DISPLAY_RANGE[1]).float().mean(),
-            on_epoch=True,
-            sync_dist=True,
+            batch_size=batch_size,
+            add_dataloader_idx=False,
         )
 
         if batch_idx == 0 and self.trainer.is_global_zero:
