@@ -194,7 +194,8 @@ class DelicsRadialDataModule(pl.LightningDataModule):
         train_case_ids: Sequence[str] | None = None,
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         case_glob: str = 'delics_radial_case*.h5',
-        batch_size: int = 1,
+        delics_batch_size: int = 1,
+        synthetic_batch_size: int = 2,
         num_workers: int = 4,
     ) -> None:
         """Initialize the DELICS radial data module."""
@@ -627,7 +628,8 @@ class FineTuneDataModule(DataModule):
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         train_case_ids: Sequence[str] | None = None,
         case_glob: str = 'delics_radial_case*.h5',
-        batch_size: int = 1,
+        delics_batch_size: int = 1,
+        synthetic_batch_size: int = 2,
         num_workers: int = 4,
         brainweb_folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         brainweb_size: int = 256,
@@ -654,7 +656,8 @@ class FineTuneDataModule(DataModule):
         )
         self.save_hyperparameters(ignore=['folder'])
         self.train_case_ids = train_case_ids
-        self.train_batch_size = batch_size
+        self.delics_batch_size = delics_batch_size
+        self.synthetic_batch_size = synthetic_batch_size
         self.train_num_workers = num_workers
         self.delics_train_dataset: DelicsRadialDataset[Literal[False]] | None = None
         self.synthetic_train_dataset: BrainwebDataset | None = None
@@ -682,7 +685,7 @@ class FineTuneDataModule(DataModule):
             {
                 'delics': self.build_dataloader(
                     self.delics_train_dataset,
-                    batch_size=self.train_batch_size,
+                    batch_size=self.delics_batch_size,
                     shuffle=True,
                     num_workers=self.train_num_workers,
                     pin_memory=torch.cuda.is_available(),
@@ -690,7 +693,7 @@ class FineTuneDataModule(DataModule):
                 ),
                 'synthetic': self.build_dataloader(
                     self.synthetic_train_dataset,
-                    batch_size=self.train_batch_size,
+                    batch_size=self.synthetic_batch_size,
                     shuffle=True,
                     num_workers=self.train_num_workers,
                     pin_memory=True,

@@ -38,7 +38,7 @@ class FineTuneModule(BaseModule):
         pretrained_checkpoint: Path | None = None,
         pretrained_checkpoint_strict: bool = True,
         teacher_generated_loss_weight: float = 1.0,
-        teacher_augmentations_per_epoch: int = 1,
+        teacher_augmentations_per_step: int = 2,
         teacher_spatial_augmentation: bool = False,
         teacher_mix_probability: float = 0.25,
         teacher_mix_beta: float = 0.4,
@@ -51,8 +51,8 @@ class FineTuneModule(BaseModule):
         super().__init__(**kwargs)
         if not 0 < ssdu_loss_fraction < 1:
             raise ValueError('ssdu_loss_fraction must be in (0, 1).')
-        if teacher_augmentations_per_epoch < 0:
-            raise ValueError('teacher_augmentations_per_epoch must be non-negative.')
+        if teacher_augmentations_per_step < 0:
+            raise ValueError('teacher_augmentations_per_step must be non-negative.')
         if not 0 <= teacher_mix_probability <= 1:
             raise ValueError('teacher_mix_probability must be in [0, 1].')
         if teacher_mix_beta <= 0:
@@ -62,7 +62,7 @@ class FineTuneModule(BaseModule):
                 'pretrained_checkpoint': pretrained_checkpoint,
                 'pretrained_checkpoint_strict': pretrained_checkpoint_strict,
                 'teacher_generated_loss_weight': teacher_generated_loss_weight,
-                'teacher_augmentations_per_epoch': teacher_augmentations_per_epoch,
+                'teacher_augmentations_per_step': teacher_augmentations_per_step,
                 'teacher_spatial_augmentation': teacher_spatial_augmentation,
                 'teacher_mix_probability': teacher_mix_probability,
                 'teacher_mix_beta': teacher_mix_beta,
@@ -83,6 +83,7 @@ class FineTuneModule(BaseModule):
         self.current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.current_subspace_gram_in_scale: torch.Tensor | None = None
         self.teacher_cache: dict[tuple[str, int], TeacherSlice] = {}
+        self.automatic_optimization = False
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
 
@@ -473,7 +474,7 @@ class FineTuneModule(BaseModule):
         csm: torch.Tensor,
     ) -> torch.Tensor:
         """Average supervised losses over teacher-generated k-space samples."""
-        n_augmentations = self.hparams.teacher_augmentations_per_epoch
+        n_augmentations = self.hparams.teacher_augmentations_per_step
         if n_augmentations == 0:
             return torch.zeros((), device=self.device)
         losses = []
@@ -497,6 +498,22 @@ class FineTuneModule(BaseModule):
         _images, parameters = self(coil_rhs, csm_initial=csm_initial)
         return self.supervised_parameter_loss(parameters, batch)
 
+    def teacher_targets_for_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, torch.Tensor]:
+        """Fetch teacher targets and CSMs for a DELICS batch."""
+        case_ids = cast(Sequence[str], batch['case_id'])
+        teacher_slices = []
+        for case_id, slice_index in zip(case_ids, batch['slice_index'], strict=True):
+            key = (case_id, int(slice_index.item()))
+            if key not in self.teacher_cache:
+                raise RuntimeError(f'Missing teacher pseudo-reference for {case_id} slice {int(slice_index.item())}.')
+            teacher_slices.append(self.teacher_cache[key])
+        teacher_targets = tuple(
+            torch.stack(items).to(self.device)
+            for items in zip(*(teacher_slice.targets for teacher_slice in teacher_slices), strict=True)
+        )
+        teacher_csm = torch.stack([teacher_slice.csm for teacher_slice in teacher_slices]).to(self.device)
+        return teacher_targets, teacher_csm
+
     def _fine_tune_loss(
         self,
         batch: DelicsRadialBatch,
@@ -507,21 +524,8 @@ class FineTuneModule(BaseModule):
         _final_parameters, parameters, ssdu_loss = self._reconstruct_batch(batch)
         components = {'ssdu': ssdu_loss, 'teacher_generated': torch.zeros((), device=self.device)}
         if use_teacher and self.hparams.teacher_generated_loss_weight:
-            case_ids = cast(Sequence[str], batch['case_id'])
-            teacher_slices = []
-            for case_id, slice_index in zip(case_ids, batch['slice_index'], strict=True):
-                key = (case_id, int(slice_index.item()))
-                if key not in self.teacher_cache:
-                    raise RuntimeError(
-                        f'Missing teacher pseudo-reference for {case_id} slice {int(slice_index.item())}.'
-                    )
-                teacher_slices.append(self.teacher_cache[key])
-            teacher_targets = tuple(
-                torch.stack(items).to(self.device)
-                for items in zip(*(teacher_slice.targets for teacher_slice in teacher_slices), strict=True)
-            )
-            teacher_csm = torch.stack([teacher_slice.csm for teacher_slice in teacher_slices]).to(self.device)
-            if self.hparams.teacher_augmentations_per_epoch:
+            teacher_targets, teacher_csm = self.teacher_targets_for_batch(batch)
+            if self.hparams.teacher_augmentations_per_step:
                 components['teacher_generated'] = self.teacher_generated_loss(batch, teacher_targets, teacher_csm)
             else:
                 components['teacher_generated'] = self.teacher_parameter_loss(parameters, teacher_targets, batch['mask'])
@@ -533,9 +537,48 @@ class FineTuneModule(BaseModule):
 
     def training_step(self, batch: FineTuneBatch, _batch_idx: int) -> torch.Tensor:
         """Run one fine-tuning step."""
-        delics_loss, components = self._fine_tune_loss(batch['delics'], use_teacher=True)
+        optimizer = self.optimizers()
+        scheduler = self.lr_schedulers()
+        optimizer.zero_grad()
+
+        components = {
+            'ssdu': torch.zeros((), device=self.device),
+            'teacher_generated': torch.zeros((), device=self.device),
+        }
+        if self.hparams.teacher_generated_loss_weight and not self.hparams.teacher_augmentations_per_step:
+            delics_loss, components = self._fine_tune_loss(batch['delics'], use_teacher=True)
+            self.manual_backward(delics_loss)
+        else:
+            _final_parameters, _parameters, ssdu_loss = self._reconstruct_batch(batch['delics'])
+            components['ssdu'] = ssdu_loss
+            self.manual_backward(self.hparams.ssdu_loss_weight * ssdu_loss)
+            if self.hparams.teacher_generated_loss_weight:
+                teacher_targets, teacher_csm = self.teacher_targets_for_batch(batch['delics'])
+                components['teacher_generated'] = self.teacher_generated_loss(
+                    batch['delics'],
+                    teacher_targets,
+                    teacher_csm,
+                )
+                self.manual_backward(self.hparams.teacher_generated_loss_weight * components['teacher_generated'])
+
         synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
-        loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
+        self.manual_backward(self.hparams.synthetic_anchor_loss_weight * synthetic_loss)
+
+        if self.trainer.gradient_clip_val is not None:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=self.trainer.gradient_clip_val,
+                gradient_clip_algorithm=self.trainer.gradient_clip_algorithm,
+            )
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        loss = (
+            self.hparams.ssdu_loss_weight * components['ssdu'].detach()
+            + self.hparams.teacher_generated_loss_weight * components['teacher_generated'].detach()
+            + self.hparams.synthetic_anchor_loss_weight * synthetic_loss.detach()
+        )
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('train/ssdu_loss', components['ssdu'].detach(), on_step=True, on_epoch=True, sync_dist=True)
         if self.hparams.teacher_generated_loss_weight:
