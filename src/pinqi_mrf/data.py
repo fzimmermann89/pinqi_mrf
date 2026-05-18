@@ -28,7 +28,6 @@ BRAINWEB_VALUES_3T_RANDOMIZED = {
     'ves': mr2.phantoms.brainweb.BrainwebTissue((1.700, 2.100), (0.200, 0.400), (0.80, 1.00), (-0.2, 0.2)),
 }
 
-
 class BatchType(TypedDict):
     """Type hint for a batch of data."""
 
@@ -81,6 +80,7 @@ class DelicsRadialDataset(
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
         delics_noise_std: float = 1e-3,
+        slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[False] = False,
     ) -> None: ...
 
@@ -93,6 +93,7 @@ class DelicsRadialDataset(
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
         delics_noise_std: float = 1e-3,
+        slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[True],
     ) -> None: ...
 
@@ -104,6 +105,7 @@ class DelicsRadialDataset(
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
         delics_noise_std: float = 1e-3,
+        slice_trim: tuple[int, int] = (0, 0),
         include_references: IncludeReferences = False,
     ) -> None:
         """Initialize the DELICS radial dataset."""
@@ -111,10 +113,13 @@ class DelicsRadialDataset(
             raise ValueError('delics_scale must be positive.')
         if delics_noise_std < 0:
             raise ValueError('delics_noise_std must be non-negative.')
+        if any(trim < 0 for trim in slice_trim):
+            raise ValueError('slice_trim entries must be non-negative.')
         self.folder = folder
         self.case_glob = case_glob
         self.delics_scale = delics_scale
         self.delics_noise_std = delics_noise_std
+        self.slice_trim = slice_trim
         self.include_references = include_references
         allowed_case_ids = set(case_ids) if case_ids is not None else None
         self.files: list[tuple[Path, str]] = []
@@ -128,8 +133,10 @@ class DelicsRadialDataset(
                 file_index = len(self.files)
                 self.files.append((path, case_id))
                 valid = handle['valid'][()].astype(bool)
+                first_slice = slice_trim[0]
+                last_slice = len(valid) - slice_trim[1]
                 for slice_index, is_valid in enumerate(valid):
-                    if bool(is_valid):
+                    if first_slice <= slice_index < last_slice and bool(is_valid):
                         self.samples.append((file_index, slice_index))
 
         if not self.samples:
@@ -448,6 +455,7 @@ class DataModule(pl.LightningDataModule):
                 self.delics_folder,
                 case_glob=self.delics_case_glob,
                 case_ids=self.delics_val_case_ids,
+                slice_trim=(5, 1),
                 include_references=True,
             )
 
@@ -599,6 +607,7 @@ class FineTuneDataModule(DataModule):
                 self.delics_folder,
                 case_glob=self.delics_case_glob,
                 case_ids=self.train_case_ids,
+                slice_trim=(4, 0),
                 include_references=False,
             )
 

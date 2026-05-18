@@ -9,12 +9,14 @@ import torch
 from pinqi_mrf.data import DelicsRadialDataModule, DelicsRadialDataset
 
 
-def _write_delics_radial(path: Path, case_id: str = 'case001') -> None:
-    kspace = np.ones((2, 3, 4, 1, 1, 5), dtype=np.complex64)
-    mask = np.ones((2, 6, 7), dtype=bool)
-    valid = np.array([True, False])
-    reference_t1 = np.full((2, 6, 7), 1.2, dtype=np.float32)
-    reference_t2 = np.full((2, 6, 7), 0.08, dtype=np.float32)
+def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray | None = None) -> None:
+    if valid is None:
+        valid = np.array([True, False])
+    n_slices = len(valid)
+    kspace = np.ones((n_slices, 3, 4, 1, 1, 5), dtype=np.complex64)
+    mask = np.ones((n_slices, 6, 7), dtype=bool)
+    reference_t1 = np.full((n_slices, 6, 7), 1.2, dtype=np.float32)
+    reference_t2 = np.full((n_slices, 6, 7), 0.08, dtype=np.float32)
     with h5py.File(path, 'w') as handle:
         handle.attrs['case'] = case_id
         handle.create_dataset('kspace', data=kspace)
@@ -64,6 +66,15 @@ def test_delics_radial_reference_dataset_returns_reference_fields(tmp_path: Path
     assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask', 'reference_t1', 'reference_t2'}
     assert sample['reference_t1'].shape == (6, 7)
     assert sample['reference_t2'].shape == (6, 7)
+
+
+def test_delics_radial_dataset_trims_subject_slices(tmp_path: Path) -> None:
+    """Configured slice trimming removes low and high slice indices per subject."""
+    _write_delics_radial(tmp_path / 'delics_radial_case001.h5', valid=np.ones(8, dtype=bool))
+
+    dataset = DelicsRadialDataset(tmp_path, slice_trim=(2, 1), delics_noise_std=0.0)
+
+    assert [dataset[index]['slice_index'].item() for index in range(len(dataset))] == [2, 3, 4, 5, 6]
 
 
 def test_delics_radial_datamodule_filters_case_ids(tmp_path: Path) -> None:
