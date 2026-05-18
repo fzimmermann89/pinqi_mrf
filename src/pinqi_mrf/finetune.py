@@ -82,8 +82,7 @@ class FineTuneModule(BaseModule):
         self.current_nufft_loss: mr2.operators.NonUniformFastFourierOp | None = None
         self.current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.current_subspace_gram_in_scale: torch.Tensor | None = None
-        self.teacher_cache: dict[tuple[str, int], TeacherSlice] = {}
-        self.automatic_optimization = False
+        self.teacher_cache: dict[tuple[int, int], TeacherSlice] = {}
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
 
@@ -236,8 +235,7 @@ class FineTuneModule(BaseModule):
             teacher_slices = local_teacher_slices
         for dataset_index, teacher_slice in teacher_slices:
             file_index, slice_index = dataset.samples[dataset_index]
-            _path, case_id = dataset.files[file_index]
-            self.teacher_cache[(case_id, slice_index)] = teacher_slice
+            self.teacher_cache[(file_index, slice_index)] = teacher_slice
         rank_zero_info(f'Refreshed {len(self.teacher_cache)} DELICS teacher pseudo-reference slices.')
 
     def build_visible_coil_rhs(self, kspace: torch.Tensor) -> torch.Tensor:
@@ -413,12 +411,12 @@ class FineTuneModule(BaseModule):
         """Compute masked parameter loss against cached teacher maps."""
         prediction_tensors = tuple(parameter.squeeze(1, 2) for parameter in predictions[-1])
         target_tensors = tuple(target.squeeze(1, 2) for target in targets)
-        parameter_mask = mask.bool()
+        parameter_mask = mask.bool().clone()
         for target in target_tensors:
             if torch.is_complex(target):
-                parameter_mask &= torch.isfinite(target.real) & torch.isfinite(target.imag)
+                parameter_mask = parameter_mask & torch.isfinite(target.real) & torch.isfinite(target.imag)
             else:
-                parameter_mask &= torch.isfinite(target)
+                parameter_mask = parameter_mask & torch.isfinite(target)
         if not parameter_mask.any():
             return torch.zeros((), device=self.device)
         loss = torch.zeros((), device=self.device)
@@ -477,8 +475,8 @@ class FineTuneModule(BaseModule):
         n_augmentations = self.hparams.teacher_augmentations_per_step
         if n_augmentations == 0:
             return torch.zeros((), device=self.device)
-        losses = []
         mask = batch['mask'].to(self.device).bool()
+        loss_sum = torch.zeros((), device=self.device)
         for _augmentation_index in range(n_augmentations):
             mixed_targets, mixed_mask, mixed_csm = self.maybe_mix_teacher_batch(targets, mask, csm)
             augmented_targets, augmented_mask, augmented_csm = self.augment_teacher_batch(
@@ -488,8 +486,8 @@ class FineTuneModule(BaseModule):
             )
             synthetic_kspace = self.synthesize_kspace(augmented_targets, augmented_csm)
             synthetic_parameters = self.reconstruct_parameters_from_kspace(synthetic_kspace)
-            losses.append(self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask))
-        return torch.stack(losses).mean()
+            loss_sum = loss_sum + self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask)
+        return loss_sum / n_augmentations
 
     def synthetic_anchor_loss(self, batch: BatchType) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the BrainWeb supervised anchor loss used during fine-tuning."""
@@ -500,12 +498,14 @@ class FineTuneModule(BaseModule):
 
     def teacher_targets_for_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, torch.Tensor]:
         """Fetch teacher targets and CSMs for a DELICS batch."""
-        case_ids = cast(Sequence[str], batch['case_id'])
         teacher_slices = []
-        for case_id, slice_index in zip(case_ids, batch['slice_index'], strict=True):
-            key = (case_id, int(slice_index.item()))
+        for case_id, slice_index in zip(batch['case_id'], batch['slice_index'], strict=True):
+            key = (int(case_id.item()), int(slice_index.item()))
             if key not in self.teacher_cache:
-                raise RuntimeError(f'Missing teacher pseudo-reference for {case_id} slice {int(slice_index.item())}.')
+                raise RuntimeError(
+                    f'Missing teacher pseudo-reference for case {int(case_id.item())} '
+                    f'slice {int(slice_index.item())}.'
+                )
             teacher_slices.append(self.teacher_cache[key])
         teacher_targets = tuple(
             torch.stack(items).to(self.device)
@@ -514,16 +514,11 @@ class FineTuneModule(BaseModule):
         teacher_csm = torch.stack([teacher_slice.csm for teacher_slice in teacher_slices]).to(self.device)
         return teacher_targets, teacher_csm
 
-    def _fine_tune_loss(
-        self,
-        batch: DelicsRadialBatch,
-        *,
-        use_teacher: bool,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute SSDU and optional teacher-generated pseudo-reference losses."""
+    def delics_loss(self, batch: DelicsRadialBatch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the DELICS fine-tuning loss components for one batch."""
         _final_parameters, parameters, ssdu_loss = self._reconstruct_batch(batch)
         components = {'ssdu': ssdu_loss, 'teacher_generated': torch.zeros((), device=self.device)}
-        if use_teacher and self.hparams.teacher_generated_loss_weight:
+        if self.hparams.teacher_generated_loss_weight:
             teacher_targets, teacher_csm = self.teacher_targets_for_batch(batch)
             if self.hparams.teacher_augmentations_per_step:
                 components['teacher_generated'] = self.teacher_generated_loss(batch, teacher_targets, teacher_csm)
@@ -537,48 +532,9 @@ class FineTuneModule(BaseModule):
 
     def training_step(self, batch: FineTuneBatch, _batch_idx: int) -> torch.Tensor:
         """Run one fine-tuning step."""
-        optimizer = self.optimizers()
-        scheduler = self.lr_schedulers()
-        optimizer.zero_grad()
-
-        components = {
-            'ssdu': torch.zeros((), device=self.device),
-            'teacher_generated': torch.zeros((), device=self.device),
-        }
-        if self.hparams.teacher_generated_loss_weight and not self.hparams.teacher_augmentations_per_step:
-            delics_loss, components = self._fine_tune_loss(batch['delics'], use_teacher=True)
-            self.manual_backward(delics_loss)
-        else:
-            _final_parameters, _parameters, ssdu_loss = self._reconstruct_batch(batch['delics'])
-            components['ssdu'] = ssdu_loss
-            self.manual_backward(self.hparams.ssdu_loss_weight * ssdu_loss)
-            if self.hparams.teacher_generated_loss_weight:
-                teacher_targets, teacher_csm = self.teacher_targets_for_batch(batch['delics'])
-                components['teacher_generated'] = self.teacher_generated_loss(
-                    batch['delics'],
-                    teacher_targets,
-                    teacher_csm,
-                )
-                self.manual_backward(self.hparams.teacher_generated_loss_weight * components['teacher_generated'])
-
+        delics_loss, components = self.delics_loss(batch['delics'])
         synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
-        self.manual_backward(self.hparams.synthetic_anchor_loss_weight * synthetic_loss)
-
-        if self.trainer.gradient_clip_val is not None:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=self.trainer.gradient_clip_val,
-                gradient_clip_algorithm=self.trainer.gradient_clip_algorithm,
-            )
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        loss = (
-            self.hparams.ssdu_loss_weight * components['ssdu'].detach()
-            + self.hparams.teacher_generated_loss_weight * components['teacher_generated'].detach()
-            + self.hparams.synthetic_anchor_loss_weight * synthetic_loss.detach()
-        )
+        loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('train/ssdu_loss', components['ssdu'].detach(), on_step=True, on_epoch=True, sync_dist=True)
         if self.hparams.teacher_generated_loss_weight:

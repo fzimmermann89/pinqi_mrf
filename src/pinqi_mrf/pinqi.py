@@ -47,9 +47,14 @@ class PINQI(torch.nn.Module):
         nonlinear_solver_batch_size: int = 8192,
         weight_scaling: bool = False,
         normalize_inputs: bool = False,
+        use_image_net: bool = True,
+        use_parameter_net: bool = True,
+        use_dictionary_match: bool = True,
     ) -> None:
         """Initialize the model."""
         super().__init__()
+        if not use_dictionary_match and not use_parameter_net:
+            raise ValueError('use_dictionary_match=False requires use_parameter_net=True.')
         self.signalmodel = signalmodel
         if any(iteration < 0 or iteration >= n_iterations for iteration in csm_refinement_iterations):
             raise ValueError('csm_refinement_iterations must be between 0 and n_iterations - 1.')
@@ -87,6 +92,9 @@ class PINQI(torch.nn.Module):
         self.softplus = torch.nn.Softplus(beta=5)
         self.weight_scaling = weight_scaling
         self.normalize_inputs = normalize_inputs
+        self.use_image_net = use_image_net
+        self.use_parameter_net = use_parameter_net
+        self.use_dictionary_match = use_dictionary_match
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
         self.nonlinear_solver = mr2.operators.DifferentiableDictionaryMatchOp(
             self.signalmodel,
@@ -280,11 +288,15 @@ class PINQI(torch.nn.Module):
             )
 
         for iteration, (lambda_image, lambda_q, *lambda_parameters) in enumerate(self.softplus(self.lambdas_raw)):
-            image_reg = self.get_image_reg(images[-1], iteration)
+            if self.use_image_net:
+                image_reg = self.get_image_reg(images[-1], iteration)
+            else:
+                lambda_image = torch.zeros_like(lambda_image)
+                image_reg = images[-1]
             images.extend(linear_solver(lambda_image, lambda_q, image_reg, signal, rhs))
-            parameter_reg = self.get_parameter_reg(images[-1], iteration)
             if len(lambda_parameters) != self.config.n_parameter_priors:
                 raise RuntimeError('Number of parameter prior weights must match the parameter prior tuple.')
+            parameter_reg = self.get_parameter_reg(images[-1], iteration) if self.use_parameter_net else None
             if self.weight_scaling:
                 lambda_parameters = tuple(
                     lambda_parameter * scale.to(lambda_parameter)
@@ -294,13 +306,25 @@ class PINQI(torch.nn.Module):
                         strict=True,
                     )
                 )
-            parameter, signal = self.nonlinear_solver(
-                images[-1].swapaxes(0, 1),
-                prior=parameter_reg,
-                prior_precision=tuple(lambda_parameters),
-                return_signal=True,
-            )
-            signal = signal.swapaxes(0, 1)
+            if not self.use_parameter_net:
+                parameter, signal = self.nonlinear_solver(images[-1].swapaxes(0, 1), return_signal=True)
+                signal = signal.swapaxes(0, 1)
+            elif self.use_dictionary_match:
+                if parameter_reg is None:
+                    raise RuntimeError('Parameter prior is required when use_parameter_net=True.')
+                parameter, signal = self.nonlinear_solver(
+                    images[-1].swapaxes(0, 1),
+                    prior=parameter_reg,
+                    prior_precision=tuple(lambda_parameters),
+                    return_signal=True,
+                )
+                signal = signal.swapaxes(0, 1)
+            else:
+                if parameter_reg is None:
+                    raise RuntimeError('Direct parameter prediction requires use_parameter_net=True.')
+                parameter = parameter_reg
+                (signal,) = self.signalmodel(*parameter)
+                signal = signal.swapaxes(0, 1)
             parameters.append(parameter)
             if iteration in self.config.csm_refinement_iterations:
                 (csm_low,) = csm_refinement_solver(
