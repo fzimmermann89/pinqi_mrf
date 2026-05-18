@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from matplotlib.colors import Colormap
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
+from mr2.utils.sliding_window import sliding_window
 
 from pinqi_mrf.acquisition import AcquisitionData, create_radial_trajectory
 from pinqi_mrf.data import BatchType, DelicsRadialReferenceBatch, ValidationLoaderType
@@ -28,7 +29,7 @@ from pinqi_mrf.pinqi import PINQI, BaselineReconstruction, ParameterTuple
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
 
-MIN_SUPERVISED_T1 = 0.5
+MIN_SUPERVISED_T1 = 0.3
 MIN_SUPERVISED_T2 = 0.03
 T1_DISPLAY_RANGE = (0.0, 2.0)
 T2_DISPLAY_RANGE = (0.020, 0.150)
@@ -67,6 +68,7 @@ class ValidationFigureData:
     baseline_t2: torch.Tensor
     prediction_t2: torch.Tensor
     mask: torch.Tensor
+    metric_mask: torch.Tensor
 
 
 class PretrainHParams(Protocol):
@@ -472,6 +474,7 @@ class BaseModule(pl.LightningModule):
                 outputs.baseline_t1,
                 outputs.prediction_t1,
                 outputs.mask,
+                outputs.metric_mask,
                 't1',
                 '$T_1$ [s]',
                 T1_DISPLAY_RANGE,
@@ -483,6 +486,7 @@ class BaseModule(pl.LightningModule):
                 outputs.baseline_t2,
                 outputs.prediction_t2,
                 outputs.mask,
+                outputs.metric_mask,
                 't2',
                 '$T_2$ [s]',
                 T2_DISPLAY_RANGE,
@@ -622,7 +626,27 @@ class BaseModule(pl.LightningModule):
             baseline_t2=result.t2.baseline.detach().cpu(),
             prediction_t2=result.t2.prediction.detach().cpu(),
             mask=mask.detach().cpu(),
+            metric_mask=result.metric_mask.detach().cpu(),
         )
+
+    @staticmethod
+    def _ssim_valid_window_fraction(mask: torch.Tensor) -> torch.Tensor:
+        """Return the fraction of SSIM windows fully inside the metric mask."""
+        mask_ssim = mask[:, None].float()
+        windows = sliding_window(mask_ssim, window_shape=(1, 7, 7), dim=(-3, -2, -1))
+        valid_windows = ~torch.isclose(windows, torch.tensor(0, dtype=windows.dtype, device=windows.device)).any(
+            (-3, -2, -1),
+        )
+        return valid_windows.float().mean()
+
+    def mask_debug_metrics(self, prefix: str, mask: torch.Tensor, metric_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return validation mask diagnostics."""
+        return {
+            f'debug/{prefix}/mask_fraction': mask.float().mean(),
+            f'debug/{prefix}/metric_mask_fraction': metric_mask.float().mean(),
+            f'debug/{prefix}/metric_mask_removed_fraction': (mask & ~metric_mask).float().mean(),
+            f'debug/{prefix}/ssim_valid_window_fraction': self._ssim_valid_window_fraction(metric_mask),
+        }
 
     def _synthetic_validation_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int) -> None:
         """Run one synthetic validation step."""
@@ -679,6 +703,7 @@ class BaseModule(pl.LightningModule):
                 **self.parameter_validation_metrics(prefix, result, include_ssim=False),
                 f'{prefix}/loss': loss,
                 **{f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
+                **self.mask_debug_metrics(prefix, mask, metric_mask),
                 f'debug/{prefix}/pred_t2_abs_max': pred_t2_masked.abs().amax(),
                 f'debug/{prefix}/pred_t2_min': pred_t2_masked.amin(),
                 f'debug/{prefix}/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
@@ -719,7 +744,10 @@ class BaseModule(pl.LightningModule):
             clip_to_target_range=True,
         )
         self.log_dict(
-            self.parameter_validation_metrics(prefix, result),
+            {
+                **self.parameter_validation_metrics(prefix, result),
+                **self.mask_debug_metrics(prefix, mask, result.metric_mask),
+            },
             on_epoch=True,
             sync_dist=True,
             batch_size=len(mask),
@@ -777,6 +805,7 @@ class BaseModule(pl.LightningModule):
         baseline: torch.Tensor,
         prediction: torch.Tensor,
         mask: torch.Tensor,
+        metric_mask: torch.Tensor,
         name: str,
         label: str,
         value_range: tuple[float, float],
@@ -785,13 +814,14 @@ class BaseModule(pl.LightningModule):
         """Log one parameter figure to W&B."""
         samples = len(mask)
         vmin, vmax = value_range
-        fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
+        fig, axes = plt.subplots(6, samples, figsize=(4 * samples, 24), squeeze=False)
         for sample in range(samples):
             self.result_plot(
                 target[sample],
                 baseline[sample],
                 prediction[sample],
                 mask[sample],
+                metric_mask[sample],
                 axes[:, sample],
                 label,
                 vmin=vmin,
@@ -808,6 +838,7 @@ class BaseModule(pl.LightningModule):
         baseline: torch.Tensor,
         pred: torch.Tensor,
         mask: torch.Tensor,
+        metric_mask: torch.Tensor,
         axes: Sequence[plt.Axes] | np.ndarray,
         label: str,
         vmax: float | None = None,
@@ -819,9 +850,10 @@ class BaseModule(pl.LightningModule):
         baseline = baseline.squeeze().detach().cpu()
         pred = pred.squeeze().detach().cpu()
         mask = mask.squeeze().detach().bool().cpu()
-        target[~mask] = torch.nan
-        baseline[~mask] = torch.nan
-        pred[~mask] = torch.nan
+        metric_mask = metric_mask.squeeze().detach().bool().cpu()
+        target[~metric_mask] = torch.nan
+        baseline[~metric_mask] = torch.nan
+        pred[~metric_mask] = torch.nan
         difference = target - pred
         if vmax is None:
             vmax = np.nanpercentile(target.numpy(), 99)
@@ -846,6 +878,12 @@ class BaseModule(pl.LightningModule):
         axes[3].set_title('PINQI Error')
         axes[3].axis('off')
         plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$ [s]')
+        axes[4].imshow(mask, vmin=0, vmax=1, cmap='gray')
+        axes[4].set_title('Dataset Mask')
+        axes[4].axis('off')
+        axes[5].imshow(metric_mask, vmin=0, vmax=1, cmap='gray')
+        axes[5].set_title('Metric Mask')
+        axes[5].axis('off')
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning-rate scheduler."""
