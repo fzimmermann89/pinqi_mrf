@@ -68,7 +68,6 @@ class ValidationFigureData:
     baseline_t2: torch.Tensor
     prediction_t2: torch.Tensor
     mask: torch.Tensor
-    metric_mask: torch.Tensor
 
 
 class PretrainHParams(Protocol):
@@ -474,7 +473,6 @@ class BaseModule(pl.LightningModule):
                 outputs.baseline_t1,
                 outputs.prediction_t1,
                 outputs.mask,
-                outputs.metric_mask,
                 't1',
                 '$T_1$ [s]',
                 T1_DISPLAY_RANGE,
@@ -486,7 +484,6 @@ class BaseModule(pl.LightningModule):
                 outputs.baseline_t2,
                 outputs.prediction_t2,
                 outputs.mask,
-                outputs.metric_mask,
                 't2',
                 '$T_2$ [s]',
                 T2_DISPLAY_RANGE,
@@ -551,6 +548,7 @@ class BaseModule(pl.LightningModule):
         reference_t2: torch.Tensor,
         *,
         clip_to_target_range: bool = False,
+        apply_parameter_thresholds: bool = True,
     ) -> ParameterValidationResult:
         """Evaluate reconstruction quality against reference T1/T2 maps."""
         if len(prediction_parameters) < 3 or len(baseline_parameters) < 3:
@@ -569,7 +567,10 @@ class BaseModule(pl.LightningModule):
         target_r2_map = target_r2.squeeze(1, 2)
         target_t1_map = target_t1.squeeze(1, 2)
         target_t2_map = target_t2.squeeze(1, 2)
-        metric_mask = self._parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
+        if apply_parameter_thresholds:
+            metric_mask = self._parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
+        else:
+            metric_mask = self._finite_parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
         return ParameterValidationResult(
             t1=self._evaluate_relaxation_time_validation(
                 target_t1,
@@ -626,7 +627,6 @@ class BaseModule(pl.LightningModule):
             baseline_t2=result.t2.baseline.detach().cpu(),
             prediction_t2=result.t2.prediction.detach().cpu(),
             mask=mask.detach().cpu(),
-            metric_mask=result.metric_mask.detach().cpu(),
         )
 
     @staticmethod
@@ -742,6 +742,7 @@ class BaseModule(pl.LightningModule):
             batch['reference_t1'].to(self.device)[:, None, None],
             batch['reference_t2'].to(self.device)[:, None, None],
             clip_to_target_range=True,
+            apply_parameter_thresholds=False,
         )
         self.log_dict(
             {
@@ -798,6 +799,23 @@ class BaseModule(pl.LightningModule):
             & (target_t2 >= MIN_SUPERVISED_T2)
         )
 
+    @staticmethod
+    def _finite_parameter_mask(
+        mask: torch.Tensor,
+        target_r1: torch.Tensor,
+        target_r2: torch.Tensor,
+        target_t1: torch.Tensor,
+        target_t2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the mask used for validation metrics without parameter-range thresholding."""
+        return (
+            mask
+            & torch.isfinite(target_r1)
+            & torch.isfinite(target_r2)
+            & torch.isfinite(target_t1)
+            & torch.isfinite(target_t2)
+        )
+
     def _log_relaxation_time_figure(
         self,
         loader_id: str,
@@ -805,7 +823,6 @@ class BaseModule(pl.LightningModule):
         baseline: torch.Tensor,
         prediction: torch.Tensor,
         mask: torch.Tensor,
-        metric_mask: torch.Tensor,
         name: str,
         label: str,
         value_range: tuple[float, float],
@@ -814,14 +831,13 @@ class BaseModule(pl.LightningModule):
         """Log one parameter figure to W&B."""
         samples = len(mask)
         vmin, vmax = value_range
-        fig, axes = plt.subplots(6, samples, figsize=(4 * samples, 24), squeeze=False)
+        fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
         for sample in range(samples):
             self.result_plot(
                 target[sample],
                 baseline[sample],
                 prediction[sample],
                 mask[sample],
-                metric_mask[sample],
                 axes[:, sample],
                 label,
                 vmin=vmin,
@@ -838,7 +854,6 @@ class BaseModule(pl.LightningModule):
         baseline: torch.Tensor,
         pred: torch.Tensor,
         mask: torch.Tensor,
-        metric_mask: torch.Tensor,
         axes: Sequence[plt.Axes] | np.ndarray,
         label: str,
         vmax: float | None = None,
@@ -850,10 +865,9 @@ class BaseModule(pl.LightningModule):
         baseline = baseline.squeeze().detach().cpu()
         pred = pred.squeeze().detach().cpu()
         mask = mask.squeeze().detach().bool().cpu()
-        metric_mask = metric_mask.squeeze().detach().bool().cpu()
-        target[~metric_mask] = torch.nan
-        baseline[~metric_mask] = torch.nan
-        pred[~metric_mask] = torch.nan
+        target[~mask] = torch.nan
+        baseline[~mask] = torch.nan
+        pred[~mask] = torch.nan
         difference = target - pred
         if vmax is None:
             vmax = np.nanpercentile(target.numpy(), 99)
@@ -878,12 +892,6 @@ class BaseModule(pl.LightningModule):
         axes[3].set_title('PINQI Error')
         axes[3].axis('off')
         plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$ [s]')
-        axes[4].imshow(mask, vmin=0, vmax=1, cmap='gray')
-        axes[4].set_title('Dataset Mask')
-        axes[4].axis('off')
-        axes[5].imshow(metric_mask, vmin=0, vmax=1, cmap='gray')
-        axes[5].set_title('Metric Mask')
-        axes[5].axis('off')
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning-rate scheduler."""
