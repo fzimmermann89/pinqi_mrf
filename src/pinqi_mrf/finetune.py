@@ -37,13 +37,13 @@ class FineTuneModule(BaseModule):
         self,
         pretrained_checkpoint: Path | None = None,
         pretrained_checkpoint_strict: bool = True,
-        teacher_generated_loss_weight: float = 1.0,
+        teacher_generated_loss_weight: float = 0.1,
         teacher_augmentations_per_step: int = 2,
-        teacher_spatial_augmentation: bool = False,
+        teacher_spatial_augmentation: bool = True,
         teacher_mix_probability: float = 0.25,
         teacher_mix_beta: float = 0.4,
         ssdu_loss_fraction: float = 0.2,
-        ssdu_loss_weight: float = 1.0,
+        ssdu_loss_weight: float = 50.0,
         synthetic_anchor_loss_weight: float = 1.0,
         **kwargs: object,
     ) -> None:
@@ -327,14 +327,14 @@ class FineTuneModule(BaseModule):
         mask: torch.Tensor,
         csm: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
-        """Apply fixed CSM flip, optional BrainWeb spatial augmentation, and intensity jitter."""
-        csm = torch.flip(csm, dims=(-1,))
+        """Apply teacher-map geometric/value augmentation and independent CSM flips."""
         if not self.hparams.teacher_spatial_augmentation:
             return (
                 self._apply_teacher_intensity_augmentation(targets, mask),
                 mask,
                 csm,
             )
+
         shape = targets[0].shape
         csm_shape = csm.shape
         csm_channels = csm.shape[1] * csm.shape[2]
@@ -357,8 +357,17 @@ class FineTuneModule(BaseModule):
             ),
             dim=1,
         )
-        augment = mr2.phantoms.brainweb.augment(size=shape[-1], trim=False)
+        augment = mr2.phantoms.brainweb.augment(
+            size=shape[-1],
+            trim=False,
+            max_random_shear=3,
+            max_random_rotation=5,
+            max_random_scaling_factor=0.05,
+            p_horizontal_flip=0.5,
+            p_vertical_flip=0.0,
+        )
         augmented = torch.stack([augment(sample) for sample in channels])
+
         augmented_targets = []
         channel_offset = 0
         for target_shape, is_complex, channel_count in target_specs:
@@ -372,14 +381,24 @@ class FineTuneModule(BaseModule):
                     augmented[:, channel_offset : channel_offset + channel_count].reshape(target_shape)
                 )
                 channel_offset += channel_count
-        mask_augmented = augmented[:, channel_offset]
+        map_mask = augmented[:, channel_offset] > 0.5
         channel_offset += 1
         csm_real = augmented[:, channel_offset : channel_offset + csm_channels]
         csm_imag = augmented[:, channel_offset + csm_channels : channel_offset + 2 * csm_channels]
-        augmented_mask = mask_augmented > 0.5
-        augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_targets), augmented_mask)
         augmented_csm = torch.complex(csm_real, csm_imag).reshape(csm_shape)
-        return augmented_targets, augmented_mask, augmented_csm
+
+        batch_size = map_mask.shape[0]
+        csm_flip = torch.rand((batch_size,), device=self.device) < 0.5
+        mask_flip_shape = (batch_size,) + (1,) * (map_mask.ndim - 1)
+        csm_flip_shape = (batch_size,) + (1,) * (augmented_csm.ndim - 1)
+
+        csm_flip_csm = csm_flip.reshape(csm_flip_shape)
+        csm_flip_mask = csm_flip.reshape(mask_flip_shape)
+        flipped_csm = torch.where(csm_flip_csm, torch.flip(augmented_csm, dims=(-1,)), augmented_csm)
+        csm_mask = torch.where(csm_flip_mask, torch.flip(map_mask, dims=(-1,)), map_mask)
+        augmented_mask = map_mask & csm_mask
+        augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_targets), augmented_mask)
+        return augmented_targets, augmented_mask, flipped_csm
 
     def maybe_mix_teacher_batch(
         self,
