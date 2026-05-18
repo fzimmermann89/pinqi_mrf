@@ -94,13 +94,14 @@ class FineTuneHParams(PretrainHParams, Protocol):
 
     pretrained_checkpoint: Path | None
     pretrained_checkpoint_strict: bool
-    teacher_loss_weight: float
+    teacher_generated_loss_weight: float
     teacher_augmentations_per_epoch: int
     teacher_spatial_augmentation: bool
     teacher_mix_probability: float
     teacher_mix_beta: float
     ssdu_loss_fraction: float
     ssdu_loss_weight: float
+    synthetic_anchor_loss_weight: float
 
 
 class BaseModule(pl.LightningModule):

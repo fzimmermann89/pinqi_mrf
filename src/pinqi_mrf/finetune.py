@@ -13,7 +13,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
 from pinqi_mrf.acquisition import AcquisitionData
-from pinqi_mrf.data import DelicsRadialBatch
+from pinqi_mrf.data import BatchType, DelicsRadialBatch, FineTuneBatch
 from pinqi_mrf.pinqi import ParameterTuple
 from pinqi_mrf.train import BaseModule, FineTuneHParams
 
@@ -37,13 +37,14 @@ class FineTuneModule(BaseModule):
         self,
         pretrained_checkpoint: Path | None = None,
         pretrained_checkpoint_strict: bool = True,
-        teacher_loss_weight: float = 0.0,
-        teacher_augmentations_per_epoch: int = 0,
+        teacher_generated_loss_weight: float = 1.0,
+        teacher_augmentations_per_epoch: int = 1,
         teacher_spatial_augmentation: bool = False,
-        teacher_mix_probability: float = 0.0,
+        teacher_mix_probability: float = 0.25,
         teacher_mix_beta: float = 0.4,
         ssdu_loss_fraction: float = 0.2,
         ssdu_loss_weight: float = 1.0,
+        synthetic_anchor_loss_weight: float = 1.0,
         **kwargs: object,
     ) -> None:
         """Initialize the fine-tuning module."""
@@ -60,13 +61,14 @@ class FineTuneModule(BaseModule):
             {
                 'pretrained_checkpoint': pretrained_checkpoint,
                 'pretrained_checkpoint_strict': pretrained_checkpoint_strict,
-                'teacher_loss_weight': teacher_loss_weight,
+                'teacher_generated_loss_weight': teacher_generated_loss_weight,
                 'teacher_augmentations_per_epoch': teacher_augmentations_per_epoch,
                 'teacher_spatial_augmentation': teacher_spatial_augmentation,
                 'teacher_mix_probability': teacher_mix_probability,
                 'teacher_mix_beta': teacher_mix_beta,
                 'ssdu_loss_fraction': ssdu_loss_fraction,
                 'ssdu_loss_weight': ssdu_loss_weight,
+                'synthetic_anchor_loss_weight': synthetic_anchor_loss_weight,
             }
         )
         self.hparams: FineTuneHParams
@@ -102,7 +104,7 @@ class FineTuneModule(BaseModule):
         """Defer SSDU operator construction to epoch start."""
         super().on_fit_start()
         if (
-            self.hparams.teacher_loss_weight
+            self.hparams.teacher_generated_loss_weight
             and self.hparams.pretrained_checkpoint is None
             and self.trainer.ckpt_path is None
         ):
@@ -115,7 +117,7 @@ class FineTuneModule(BaseModule):
     def on_train_epoch_start(self) -> None:
         """Update the epoch-wise SSDU split and visible normal operator."""
         self.setup_ssdu_split()
-        if self.hparams.teacher_loss_weight:
+        if self.hparams.teacher_generated_loss_weight:
             self.refresh_teacher_cache()
 
     def _sample_ssdu_split(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -172,9 +174,9 @@ class FineTuneModule(BaseModule):
     def refresh_teacher_cache(self) -> None:
         """Predict epoch-level teacher parameter maps for the DELICS training dataset."""
         datamodule = self.trainer.datamodule
-        dataset = getattr(datamodule, 'train_dataset', None)
+        dataset = getattr(datamodule, 'delics_train_dataset', None)
         if dataset is None:
-            raise RuntimeError('Teacher refresh requires a datamodule with a train_dataset.')
+            raise RuntimeError('Teacher refresh requires a datamodule with a delics_train_dataset.')
         world_size = int(getattr(self.trainer, 'world_size', 1))
         global_rank = int(getattr(self.trainer, 'global_rank', 0))
 
@@ -464,13 +466,13 @@ class FineTuneModule(BaseModule):
         )
         return parameters
 
-    def synthetic_teacher_loss(
+    def teacher_generated_loss(
         self,
         batch: DelicsRadialBatch,
         targets: tuple[torch.Tensor, ...],
         csm: torch.Tensor,
     ) -> torch.Tensor:
-        """Average supervised losses over augmented synthetic teacher samples."""
+        """Average supervised losses over teacher-generated k-space samples."""
         n_augmentations = self.hparams.teacher_augmentations_per_epoch
         if n_augmentations == 0:
             return torch.zeros((), device=self.device)
@@ -488,16 +490,23 @@ class FineTuneModule(BaseModule):
             losses.append(self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask))
         return torch.stack(losses).mean()
 
+    def synthetic_anchor_loss(self, batch: BatchType) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the BrainWeb supervised anchor loss used during fine-tuning."""
+        coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
+        csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
+        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        return self.supervised_parameter_loss(parameters, batch)
+
     def _fine_tune_loss(
         self,
         batch: DelicsRadialBatch,
         *,
         use_teacher: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute SSDU and optional teacher pseudo-reference losses."""
+        """Compute SSDU and optional teacher-generated pseudo-reference losses."""
         _final_parameters, parameters, ssdu_loss = self._reconstruct_batch(batch)
-        components = {'ssdu': ssdu_loss, 'teacher': torch.zeros((), device=self.device)}
-        if use_teacher and self.hparams.teacher_loss_weight:
+        components = {'ssdu': ssdu_loss, 'teacher_generated': torch.zeros((), device=self.device)}
+        if use_teacher and self.hparams.teacher_generated_loss_weight:
             case_ids = cast(Sequence[str], batch['case_id'])
             teacher_slices = []
             for case_id, slice_index in zip(case_ids, batch['slice_index'], strict=True):
@@ -513,20 +522,39 @@ class FineTuneModule(BaseModule):
             )
             teacher_csm = torch.stack([teacher_slice.csm for teacher_slice in teacher_slices]).to(self.device)
             if self.hparams.teacher_augmentations_per_epoch:
-                components['teacher'] = self.synthetic_teacher_loss(batch, teacher_targets, teacher_csm)
+                components['teacher_generated'] = self.teacher_generated_loss(batch, teacher_targets, teacher_csm)
             else:
-                components['teacher'] = self.teacher_parameter_loss(parameters, teacher_targets, batch['mask'])
+                components['teacher_generated'] = self.teacher_parameter_loss(parameters, teacher_targets, batch['mask'])
         loss = (
             self.hparams.ssdu_loss_weight * components['ssdu']
-            + self.hparams.teacher_loss_weight * components['teacher']
+            + self.hparams.teacher_generated_loss_weight * components['teacher_generated']
         )
         return loss, components
 
-    def training_step(self, batch: DelicsRadialBatch, _batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: FineTuneBatch, _batch_idx: int) -> torch.Tensor:
         """Run one fine-tuning step."""
-        loss, components = self._fine_tune_loss(batch, use_teacher=True)
+        delics_loss, components = self._fine_tune_loss(batch['delics'], use_teacher=True)
+        synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
+        loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('train/ssdu_loss', components['ssdu'].detach(), on_step=True, on_epoch=True, sync_dist=True)
-        if self.hparams.teacher_loss_weight:
-            self.log('train/teacher_loss', components['teacher'].detach(), on_step=True, on_epoch=True, sync_dist=True)
+        if self.hparams.teacher_generated_loss_weight:
+            self.log(
+                'train/teacher_generated_loss',
+                components['teacher_generated'].detach(),
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+        if self.hparams.synthetic_anchor_loss_weight:
+            self.log('train/synthetic_loss', synthetic_loss.detach(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log_dict(
+                {
+                    f'debug/train/synthetic_loss_{key}': value.detach()
+                    for key, value in synthetic_components.items()
+                },
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
         return loss

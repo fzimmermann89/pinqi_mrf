@@ -11,6 +11,7 @@ import h5py
 import lightning.pytorch as pl
 import mr2
 import torch
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
 from pinqi_mrf.parameters import R1_STATS, R2_STATS, relaxation_time_to_standardized_rate
 
@@ -56,6 +57,13 @@ class DelicsRadialReferenceBatch(DelicsRadialBatch):
     reference_t2: torch.Tensor
 
 
+class FineTuneBatch(TypedDict):
+    """Type hint for one combined fine-tuning batch."""
+
+    delics: DelicsRadialBatch
+    synthetic: BatchType
+
+
 class ValidationLoaderType(StrEnum):
     """Kinds of validation loaders used during training."""
 
@@ -80,7 +88,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
-        delics_noise_std: float = 1e-3,
+        delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[False] = False,
     ) -> None: ...
@@ -93,7 +101,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
-        delics_noise_std: float = 1e-3,
+        delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[True],
     ) -> None: ...
@@ -105,7 +113,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 250.0,
-        delics_noise_std: float = 1e-3,
+        delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: IncludeReferences = False,
     ) -> None:
@@ -417,6 +425,81 @@ class DataModule(pl.LightningDataModule):
         self.synthetic_val_dataset: torch.utils.data.Subset[BrainwebDataset] | None = None
         self.delics_val_dataset: DelicsRadialDataset[Literal[True]] | None = None
 
+    def build_brainweb_dataset(
+        self,
+        *,
+        orientation: Sequence[Literal['axial', 'coronal', 'sagittal']],
+        random: bool,
+    ) -> BrainwebDataset:
+        """Build a BrainWeb parameter-map dataset with the shared settings."""
+        return BrainwebDataset(
+            folder=self.folder,
+            size=self.size,
+            n_coils=self.n_coils,
+            noise=self.noise,
+            r1_stats=self.r1_stats,
+            r2_stats=self.r2_stats,
+            orientation=orientation,
+            random=random,
+        )
+
+    @overload
+    def build_delics_dataset(
+        self,
+        *,
+        case_ids: Sequence[str] | None,
+        slice_trim: tuple[int, int],
+        include_references: Literal[False],
+    ) -> DelicsRadialDataset[Literal[False]]: ...
+
+    @overload
+    def build_delics_dataset(
+        self,
+        *,
+        case_ids: Sequence[str] | None,
+        slice_trim: tuple[int, int],
+        include_references: Literal[True],
+    ) -> DelicsRadialDataset[Literal[True]]: ...
+
+    def build_delics_dataset(
+        self,
+        *,
+        case_ids: Sequence[str] | None,
+        slice_trim: tuple[int, int],
+        include_references: Literal[False] | Literal[True],
+    ) -> DelicsRadialDataset[Literal[False]] | DelicsRadialDataset[Literal[True]]:
+        """Build a DELICS radial dataset with the shared settings."""
+        return DelicsRadialDataset(
+            self.delics_folder,
+            case_glob=self.delics_case_glob,
+            case_ids=case_ids,
+            slice_trim=slice_trim,
+            include_references=include_references,
+        )
+
+    @staticmethod
+    def build_dataloader(
+        dataset: torch.utils.data.Dataset,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        num_workers: int,
+        pin_memory: bool,
+        drop_last: bool,
+    ) -> torch.utils.data.DataLoader:
+        """Build a dataloader with the project defaults."""
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=4 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            worker_init_fn=lambda *_: torch.set_num_threads(1),
+            drop_last=drop_last,
+        )
+
     @property
     def validation_loader_types(self) -> tuple[ValidationLoaderType, ...]:
         """Return the ordered validation loader types."""
@@ -433,22 +516,14 @@ class DataModule(pl.LightningDataModule):
         _ = stage
         if self.synthetic_val_dataset is None:
             self.synthetic_val_dataset = torch.utils.data.Subset(
-                BrainwebDataset(
-                    folder=self.folder,
-                    size=self.size,
-                    n_coils=self.n_coils,
-                    noise=self.noise,
-                    r1_stats=self.r1_stats,
-                    r2_stats=self.r2_stats,
+                self.build_brainweb_dataset(
                     orientation=('axial',),
                     random=False,
                 ),
                 list(range(30, 500, 20)),
             )
         if self.delics_val_dataset is None:
-            self.delics_val_dataset = DelicsRadialDataset(
-                self.delics_folder,
-                case_glob=self.delics_case_glob,
+            self.delics_val_dataset = self.build_delics_dataset(
                 case_ids=self.delics_val_case_ids,
                 slice_trim=(0, 0),
                 include_references=True,
@@ -458,13 +533,12 @@ class DataModule(pl.LightningDataModule):
         """Return the BrainWeb validation dataloader."""
         if self.synthetic_val_dataset is None:
             raise RuntimeError('DataModule.setup() must be called before synthetic_val_dataloader().')
-        return torch.utils.data.DataLoader(
+        return self.build_dataloader(
             self.synthetic_val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=False,
-            persistent_workers=self.num_workers > 0,
             drop_last=True,
         )
 
@@ -472,13 +546,12 @@ class DataModule(pl.LightningDataModule):
         """Return the DELICS validation dataloader."""
         if self.delics_val_dataset is None:
             raise RuntimeError('DataModule.setup() must be called before delics_val_dataloader().')
-        return torch.utils.data.DataLoader(
+        return self.build_dataloader(
             self.delics_val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=False,
-            persistent_workers=self.num_workers > 0,
             drop_last=False,
         )
 
@@ -525,13 +598,7 @@ class PretrainDataModule(DataModule):
         """Set up shared validation and BrainWeb training."""
         super().setup(stage)
         if self.train_dataset is None:
-            self.train_dataset = BrainwebDataset(
-                folder=self.folder,
-                size=self.size,
-                n_coils=self.n_coils,
-                noise=self.noise,
-                r1_stats=self.r1_stats,
-                r2_stats=self.r2_stats,
+            self.train_dataset = self.build_brainweb_dataset(
                 orientation=('axial', 'coronal', 'sagittal'),
                 random=True,
             )
@@ -540,15 +607,12 @@ class PretrainDataModule(DataModule):
         """Return the BrainWeb training dataloader."""
         if self.train_dataset is None:
             raise RuntimeError('PretrainDataModule.setup() must be called before train_dataloader().')
-        return torch.utils.data.DataLoader(
+        return self.build_dataloader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            prefetch_factor=4 if self.num_workers > 0 else None,
-            persistent_workers=self.num_workers > 0,
-            worker_init_fn=lambda *_: torch.set_num_threads(1),
             drop_last=True,
         )
 
@@ -565,59 +629,73 @@ class FineTuneDataModule(DataModule):
         case_glob: str = 'delics_radial_case*.h5',
         batch_size: int = 1,
         num_workers: int = 4,
-        brainweb_val_folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
-        brainweb_val_size: int = 256,
-        brainweb_val_n_coils: int = 12,
-        brainweb_val_noise: tuple[float, float] = (0.0, 0.05),
-        brainweb_val_r1_stats: tuple[float, float] = R1_STATS,
-        brainweb_val_r2_stats: tuple[float, float] = R2_STATS,
-        brainweb_val_batch_size: int = 6,
-        brainweb_val_num_workers: int = 0,
+        brainweb_folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
+        brainweb_size: int = 256,
+        brainweb_n_coils: int = 12,
+        brainweb_noise: tuple[float, float] = (0.0, 0.05),
+        brainweb_r1_stats: tuple[float, float] = R1_STATS,
+        brainweb_r2_stats: tuple[float, float] = R2_STATS,
+        val_batch_size: int = 6,
+        val_num_workers: int = 0,
     ) -> None:
         """Initialize the fine-tuning datamodule."""
         super().__init__(
-            folder=brainweb_val_folder,
+            folder=brainweb_folder,
             delics_folder=folder,
             delics_val_case_ids=val_case_ids,
             delics_case_glob=case_glob,
-            size=brainweb_val_size,
-            n_coils=brainweb_val_n_coils,
-            noise=brainweb_val_noise,
-            r1_stats=brainweb_val_r1_stats,
-            r2_stats=brainweb_val_r2_stats,
-            batch_size=brainweb_val_batch_size,
-            num_workers=brainweb_val_num_workers,
+            size=brainweb_size,
+            n_coils=brainweb_n_coils,
+            noise=brainweb_noise,
+            r1_stats=brainweb_r1_stats,
+            r2_stats=brainweb_r2_stats,
+            batch_size=val_batch_size,
+            num_workers=val_num_workers,
         )
         self.save_hyperparameters(ignore=['folder'])
         self.train_case_ids = train_case_ids
         self.train_batch_size = batch_size
         self.train_num_workers = num_workers
-        self.train_dataset: DelicsRadialDataset[Literal[False]] | None = None
+        self.delics_train_dataset: DelicsRadialDataset[Literal[False]] | None = None
+        self.synthetic_train_dataset: BrainwebDataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
-        """Set up shared validation and DELICS training."""
+        """Set up shared validation and fine-tuning training datasets."""
         super().setup(stage)
-        if self.train_dataset is None:
-            self.train_dataset = DelicsRadialDataset(
-                self.delics_folder,
-                case_glob=self.delics_case_glob,
+        if self.delics_train_dataset is None:
+            self.delics_train_dataset = self.build_delics_dataset(
                 case_ids=self.train_case_ids,
                 slice_trim=(0, 0),
                 include_references=False,
             )
+        if self.synthetic_train_dataset is None:
+            self.synthetic_train_dataset = self.build_brainweb_dataset(
+                orientation=('axial', 'coronal', 'sagittal'),
+                random=True,
+            )
 
-    def train_dataloader(self) -> torch.utils.data.DataLoader:
-        """Return the DELICS training dataloader."""
-        if self.train_dataset is None:
+    def train_dataloader(self) -> CombinedLoader:
+        """Return paired DELICS and synthetic training loaders."""
+        if self.delics_train_dataset is None or self.synthetic_train_dataset is None:
             raise RuntimeError('FineTuneDataModule.setup() must be called before train_dataloader().')
-        return torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=self.train_batch_size,
-            shuffle=True,
-            num_workers=self.train_num_workers,
-            pin_memory=torch.cuda.is_available(),
-            prefetch_factor=4 if self.train_num_workers > 0 else None,
-            persistent_workers=self.train_num_workers > 0,
-            worker_init_fn=lambda *_: torch.set_num_threads(1),
-            drop_last=False,
+        return CombinedLoader(
+            {
+                'delics': self.build_dataloader(
+                    self.delics_train_dataset,
+                    batch_size=self.train_batch_size,
+                    shuffle=True,
+                    num_workers=self.train_num_workers,
+                    pin_memory=torch.cuda.is_available(),
+                    drop_last=False,
+                ),
+                'synthetic': self.build_dataloader(
+                    self.synthetic_train_dataset,
+                    batch_size=self.train_batch_size,
+                    shuffle=True,
+                    num_workers=self.train_num_workers,
+                    pin_memory=True,
+                    drop_last=True,
+                ),
+            },
+            mode='max_size_cycle',
         )
