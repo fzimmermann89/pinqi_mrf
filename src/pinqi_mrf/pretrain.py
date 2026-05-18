@@ -19,13 +19,13 @@ class PretrainModule(BaseModule):
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
         csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
         if self.global_step % 10 == 0:
-            self.log_csm_diagnostics(csm_initial, prefix='debug/train_csm')
+            self.log_csm_diagnostics(csm_initial, prefix='debug/train/csm')
         _images, parameters = self(coil_rhs, csm_initial=csm_initial)
         loss, components = self.supervised_parameter_loss(parameters, batch)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         if self.global_step % 10 == 0:
             self.log_dict(
-                {f'debug/train_loss_{key}': value.detach() for key, value in components.items()},
+                {f'debug/train/loss_{key}': value.detach() for key, value in components.items()},
                 on_step=True,
                 on_epoch=False,
                 sync_dist=True,

@@ -449,11 +449,11 @@ class BaseModule(pl.LightningModule):
         norm = csm.abs().square().sum(dim=1).sqrt()
         self.log_dict(
             {
-                f'{prefix}_norm_min': norm.detach().amin(),
-                f'{prefix}_norm_mean': norm.detach().mean(),
-                f'{prefix}_norm_max': norm.detach().amax(),
-                f'{prefix}_low_norm_fraction': (norm < 1e-3).float().mean(),
-                f'{prefix}_finite_fraction': torch.isfinite(csm).float().mean(),
+                f'{prefix}/norm_min': norm.detach().amin(),
+                f'{prefix}/norm_mean': norm.detach().mean(),
+                f'{prefix}/norm_max': norm.detach().amax(),
+                f'{prefix}/low_norm_fraction': (norm < 1e-3).float().mean(),
+                f'{prefix}/finite_fraction': torch.isfinite(csm).float().mean(),
             },
             on_step=self.training,
             on_epoch=not self.training,
@@ -522,10 +522,10 @@ class BaseModule(pl.LightningModule):
         baseline_ssim = torch.where(metric_mask_ssim, baseline_ssim, torch.zeros_like(baseline_ssim))
         prediction_ssim = torch.where(metric_mask_ssim, prediction_ssim, torch.zeros_like(prediction_ssim))
         data_range = torch.tensor(display_range[1] - display_range[0], device=self.device)
-        (ssim,) = mr2.operators.functionals.SSIM(target_ssim, metric_mask, data_range=data_range)(prediction_ssim)
+        (ssim,) = mr2.operators.functionals.SSIM(target_ssim, metric_mask_ssim, data_range=data_range)(prediction_ssim)
         (baseline_ssim_value,) = mr2.operators.functionals.SSIM(
             target_ssim,
-            metric_mask,
+            metric_mask_ssim,
             data_range=data_range,
         )(baseline_ssim)
         return RelaxationTimeValidationResult(
@@ -586,32 +586,26 @@ class BaseModule(pl.LightningModule):
             metric_mask=metric_mask,
         )
 
-    def log_parameter_validation(
+    def parameter_validation_metrics(
         self,
         prefix: str,
         result: ParameterValidationResult,
         *,
-        batch_size: int,
-        prog_bar: bool = False,
-    ) -> None:
-        """Log common parameter-validation metrics for one validation loader."""
-        self.log_dict(
-            {
-                f'{prefix}/ssim_t1': result.t1.ssim,
-                f'{prefix}/rmse_t1': result.t1.rmse,
-                f'{prefix}/ssim_t1_baseline': result.t1.baseline_ssim,
-                f'{prefix}/rmse_t1_baseline': result.t1.baseline_rmse,
-                f'{prefix}/ssim_t2': result.t2.ssim,
-                f'{prefix}/rmse_t2': result.t2.rmse,
-                f'{prefix}/ssim_t2_baseline': result.t2.baseline_ssim,
-                f'{prefix}/rmse_t2_baseline': result.t2.baseline_rmse,
-            },
-            on_epoch=True,
-            prog_bar=prog_bar,
-            sync_dist=True,
-            batch_size=batch_size,
-            add_dataloader_idx=False,
-        )
+        include_ssim: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Return common parameter-validation metrics for one validation loader."""
+        metrics = {
+            f'{prefix}/rmse_t1': result.t1.rmse,
+            f'{prefix}/ssim_t1_baseline': result.t1.baseline_ssim,
+            f'{prefix}/rmse_t1_baseline': result.t1.baseline_rmse,
+            f'{prefix}/rmse_t2': result.t2.rmse,
+            f'{prefix}/ssim_t2_baseline': result.t2.baseline_ssim,
+            f'{prefix}/rmse_t2_baseline': result.t2.baseline_rmse,
+        }
+        if include_ssim:
+            metrics[f'{prefix}/ssim_t1'] = result.t1.ssim
+            metrics[f'{prefix}/ssim_t2'] = result.t2.ssim
+        return metrics
 
     def _store_validation_images(
         self,
@@ -632,10 +626,11 @@ class BaseModule(pl.LightningModule):
 
     def _synthetic_validation_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int) -> None:
         """Run one synthetic validation step."""
+        prefix = f'val_{dataloader_idx}'
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
         csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
         if batch_idx == 0:
-            self.log_csm_diagnostics(csm_initial, prefix='debug/val_csm')
+            self.log_csm_diagnostics(csm_initial, prefix=f'debug/{prefix}/csm')
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
@@ -648,7 +643,6 @@ class BaseModule(pl.LightningModule):
         batch_size = len(mask)
         target_t1 = standardized_rate_to_relaxation_time(batch['r1'][:, None, None], R1_STATS)
         target_t2 = standardized_rate_to_relaxation_time(batch['r2'][:, None, None], R2_STATS)
-        prefix = f'val_{dataloader_idx}'
         result = self.evaluate_parameter_validation(
             prediction_parameters,
             baseline_parameters,
@@ -662,33 +656,38 @@ class BaseModule(pl.LightningModule):
         target_t2_masked = result.t2.target.squeeze(1, 2)[metric_mask]
         pred_r2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
         pred_r2_rate_masked = pred_r2_masked * R2_STATS[1] + R2_STATS[0]
-        self.log_parameter_validation(prefix, result, batch_size=batch_size)
         self.log(
-            f'{prefix}/loss',
-            loss,
+            f'{prefix}/ssim_t1',
+            result.t1.ssim,
             on_epoch=True,
+            prog_bar=True,
             sync_dist=True,
             batch_size=batch_size,
             add_dataloader_idx=False,
         )
-        self.log_dict(
-            {f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
+        self.log(
+            f'{prefix}/ssim_t2',
+            result.t2.ssim,
             on_epoch=True,
+            prog_bar=True,
             sync_dist=True,
             batch_size=batch_size,
             add_dataloader_idx=False,
         )
         self.log_dict(
             {
-                f'{prefix}/debug/pred_t2_abs_max': pred_t2_masked.abs().amax(),
-                f'{prefix}/debug/pred_t2_min': pred_t2_masked.amin(),
-                f'{prefix}/debug/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
-                f'{prefix}/debug/baseline_t2_abs_max': baseline_t2_masked.abs().amax(),
-                f'{prefix}/debug/target_t2_abs_max': target_t2_masked.abs().amax(),
-                f'{prefix}/debug/pred_r2_min': pred_r2_masked.amin(),
-                f'{prefix}/debug/pred_r2_rate_min': pred_r2_rate_masked.amin(),
-                f'{prefix}/debug/pred_t2_invalid_fraction': (~torch.isfinite(pred_t2_masked)).float().mean(),
-                f'{prefix}/debug/pred_t2_gt_display_max_fraction': (
+                **self.parameter_validation_metrics(prefix, result, include_ssim=False),
+                f'{prefix}/loss': loss,
+                **{f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
+                f'debug/{prefix}/pred_t2_abs_max': pred_t2_masked.abs().amax(),
+                f'debug/{prefix}/pred_t2_min': pred_t2_masked.amin(),
+                f'debug/{prefix}/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
+                f'debug/{prefix}/baseline_t2_abs_max': baseline_t2_masked.abs().amax(),
+                f'debug/{prefix}/target_t2_abs_max': target_t2_masked.abs().amax(),
+                f'debug/{prefix}/pred_r2_min': pred_r2_masked.amin(),
+                f'debug/{prefix}/pred_r2_rate_min': pred_r2_rate_masked.amin(),
+                f'debug/{prefix}/pred_t2_invalid_fraction': (~torch.isfinite(pred_t2_masked)).float().mean(),
+                f'debug/{prefix}/pred_t2_gt_display_max_fraction': (
                     pred_t2_masked > T2_DISPLAY_RANGE[1]
                 ).float().mean(),
             },
@@ -719,7 +718,13 @@ class BaseModule(pl.LightningModule):
             batch['reference_t2'].to(self.device)[:, None, None],
             clip_to_target_range=True,
         )
-        self.log_parameter_validation(prefix, result, batch_size=len(mask), prog_bar=True)
+        self.log_dict(
+            self.parameter_validation_metrics(prefix, result),
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=len(mask),
+            add_dataloader_idx=False,
+        )
         if batch_idx == 0 and self.trainer.is_global_zero:
             self._store_validation_images(prefix, result, mask)
 
@@ -794,7 +799,7 @@ class BaseModule(pl.LightningModule):
                 cmap=colormap,
             )
         fig.suptitle(f'{label} Epoch {self.current_epoch}')
-        self.logger.experiment.log({f'val_{loader_id}/images/{name}': fig})
+        self.logger.experiment.log({f'{loader_id}/images/{name}': fig})
         plt.close(fig)
 
     @staticmethod

@@ -397,12 +397,10 @@ class DataModule(pl.LightningDataModule):
         r2_stats: tuple[float, float] = R2_STATS,
         batch_size: int = 6,
         num_workers: int = 4,
-        delics_val_batch_size: int = 1,
-        delics_val_num_workers: int = 0,
     ) -> None:
         """Initialize the data module."""
         super().__init__()
-        self.save_hyperparameters(ignore=['folder', 'num_workers', 'delics_folder', 'delics_val_num_workers'])
+        self.save_hyperparameters(ignore=['folder', 'num_workers', 'delics_folder'])
         self.folder = folder
         self.delics_folder = delics_folder
         self.delics_val_case_ids = delics_val_case_ids
@@ -414,8 +412,6 @@ class DataModule(pl.LightningDataModule):
         self.r2_stats = r2_stats
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.delics_val_batch_size = delics_val_batch_size
-        self.delics_val_num_workers = delics_val_num_workers
         self.synthetic_val_dataset: torch.utils.data.Subset[BrainwebDataset] | None = None
         self.delics_val_dataset: DelicsRadialDataset[Literal[True]] | None = None
 
@@ -475,11 +471,11 @@ class DataModule(pl.LightningDataModule):
             raise RuntimeError('DataModule.setup() must be called before delics_val_dataloader().')
         return torch.utils.data.DataLoader(
             self.delics_val_dataset,
-            batch_size=self.delics_val_batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.delics_val_num_workers,
+            num_workers=self.num_workers,
             pin_memory=False,
-            persistent_workers=self.delics_val_num_workers > 0,
+            persistent_workers=self.num_workers > 0,
             drop_last=False,
         )
 
@@ -505,8 +501,6 @@ class PretrainDataModule(DataModule):
         batch_size: int = 6,
         num_workers: int = 4,
         delics_val_case_glob: str = 'delics_radial_case*.h5',
-        delics_val_batch_size: int = 1,
-        delics_val_num_workers: int = 0,
     ) -> None:
         """Initialize the pretraining datamodule."""
         super().__init__(
@@ -521,8 +515,6 @@ class PretrainDataModule(DataModule):
             r2_stats=r2_stats,
             batch_size=batch_size,
             num_workers=num_workers,
-            delics_val_batch_size=delics_val_batch_size,
-            delics_val_num_workers=delics_val_num_workers,
         )
         self.train_dataset: BrainwebDataset | None = None
 
@@ -592,8 +584,6 @@ class FineTuneDataModule(DataModule):
             r2_stats=brainweb_val_r2_stats,
             batch_size=brainweb_val_batch_size,
             num_workers=brainweb_val_num_workers,
-            delics_val_batch_size=batch_size,
-            delics_val_num_workers=num_workers,
         )
         self.save_hyperparameters(ignore=['folder'])
         self.train_case_ids = train_case_ids
