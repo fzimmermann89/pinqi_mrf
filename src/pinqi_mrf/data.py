@@ -44,7 +44,7 @@ class BatchType(TypedDict):
 class DelicsRadialBatch(TypedDict):
     """Type hint for one DELICS radial k-space sample."""
 
-    case_id: str
+    case_id: torch.Tensor
     slice_index: torch.Tensor
     kspace: torch.Tensor
     mask: torch.Tensor
@@ -172,7 +172,7 @@ class DelicsRadialDataset(
                 noise = (self.delics_noise_std / math.sqrt(2.0)) * torch.complex(noise_real, noise_imag)
                 kspace = kspace + noise.to(torch.complex64)
             sample: DelicsRadialBatch | DelicsRadialReferenceBatch = {
-                'case_id': case_id,
+                'case_id': torch.tensor(file_index, dtype=torch.int64),
                 'slice_index': torch.tensor(slice_index, dtype=torch.int64),
                 'kspace': kspace,
                 'mask': torch.as_tensor(handle['mask'][slice_index], dtype=torch.bool),
@@ -194,8 +194,7 @@ class DelicsRadialDataModule(pl.LightningDataModule):
         train_case_ids: Sequence[str] | None = None,
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         case_glob: str = 'delics_radial_case*.h5',
-        delics_batch_size: int = 1,
-        synthetic_batch_size: int = 2,
+        batch_size: int = 1,
         num_workers: int = 4,
     ) -> None:
         """Initialize the DELICS radial data module."""
@@ -681,24 +680,38 @@ class FineTuneDataModule(DataModule):
         """Return paired DELICS and synthetic training loaders."""
         if self.delics_train_dataset is None or self.synthetic_train_dataset is None:
             raise RuntimeError('FineTuneDataModule.setup() must be called before train_dataloader().')
+        delics_loader = torch.utils.data.DataLoader(
+            self.delics_train_dataset,
+            batch_size=self.delics_batch_size,
+            shuffle=True,
+            num_workers=self.train_num_workers,
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=4 if self.train_num_workers > 0 else None,
+            persistent_workers=self.train_num_workers > 0,
+            worker_init_fn=lambda *_: torch.set_num_threads(1),
+            drop_last=False,
+        )
+        synthetic_sampler = torch.utils.data.RandomSampler(
+            self.synthetic_train_dataset,
+            replacement=True,
+            num_samples=len(delics_loader) * self.synthetic_batch_size,
+        )
+        synthetic_loader = torch.utils.data.DataLoader(
+            self.synthetic_train_dataset,
+            batch_size=self.synthetic_batch_size,
+            shuffle=False,
+            sampler=synthetic_sampler,
+            num_workers=self.train_num_workers,
+            pin_memory=True,
+            prefetch_factor=4 if self.train_num_workers > 0 else None,
+            persistent_workers=self.train_num_workers > 0,
+            worker_init_fn=lambda *_: torch.set_num_threads(1),
+            drop_last=False,
+        )
         return CombinedLoader(
             {
-                'delics': self.build_dataloader(
-                    self.delics_train_dataset,
-                    batch_size=self.delics_batch_size,
-                    shuffle=True,
-                    num_workers=self.train_num_workers,
-                    pin_memory=torch.cuda.is_available(),
-                    drop_last=False,
-                ),
-                'synthetic': self.build_dataloader(
-                    self.synthetic_train_dataset,
-                    batch_size=self.synthetic_batch_size,
-                    shuffle=True,
-                    num_workers=self.train_num_workers,
-                    pin_memory=True,
-                    drop_last=True,
-                ),
+                'delics': delics_loader,
+                'synthetic': synthetic_loader,
             },
-            mode='max_size_cycle',
+            mode='min_size',
         )

@@ -82,6 +82,9 @@ class PretrainHParams(Protocol):
     use_density_compensation: bool
     weight_scaling: bool
     normalize_inputs: bool
+    use_image_net: bool
+    use_parameter_net: bool
+    use_dictionary_match: bool
     lr: float
     weight_decay: float
     loss_weights: Sequence[float]
@@ -123,6 +126,9 @@ class BaseModule(pl.LightningModule):
         use_density_compensation: bool = False,  # noqa: ARG002
         weight_scaling: bool = True,
         normalize_inputs: bool = True,
+        use_image_net: bool = True,
+        use_parameter_net: bool = True,
+        use_dictionary_match: bool = True,
         n_iterations: int = 4,
         use_ground_truth_csm: bool = False,  # noqa: ARG002
         csm_estimation_iterations: int = 10,  # noqa: ARG002
@@ -184,6 +190,9 @@ class BaseModule(pl.LightningModule):
             nonlinear_solver_batch_size=nonlinear_solver_batch_size,
             weight_scaling=weight_scaling,
             normalize_inputs=normalize_inputs,
+            use_image_net=use_image_net,
+            use_parameter_net=use_parameter_net,
+            use_dictionary_match=use_dictionary_match,
         )
         self.baseline = BaselineReconstruction(
             signalmodel=self.signalmodel,
