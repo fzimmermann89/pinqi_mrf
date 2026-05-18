@@ -194,6 +194,22 @@ class BaseModule(pl.LightningModule):
         self.subspace_gram_scale: torch.Tensor | None = None
         self.noise_sampler: WhiteKspaceSubspaceRhsNoiseSampler | None = None
 
+    def on_save_checkpoint(self, checkpoint: dict[str, object]) -> None:
+        """Avoid storing runtime acquisition caches in checkpoints."""
+        state_dict = checkpoint.get('state_dict')
+        if isinstance(state_dict, dict):
+            for key in tuple(state_dict):
+                if key.startswith(('subspace_gram.', 'noise_sampler.', 'current_subspace_gram_in.')):
+                    del state_dict[key]
+
+    def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
+        """Discard runtime acquisition caches from older checkpoints before strict loading."""
+        state_dict = checkpoint.get('state_dict')
+        if isinstance(state_dict, dict):
+            for key in tuple(state_dict):
+                if key.startswith(('subspace_gram.', 'noise_sampler.', 'current_subspace_gram_in.')):
+                    del state_dict[key]
+
     @property
     def n_compressed_coils(self) -> int:
         """Return the effective number of coils after optional compression."""
