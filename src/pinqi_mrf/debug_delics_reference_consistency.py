@@ -166,24 +166,27 @@ def main() -> None:
         grid_t1 = standardized_rate_to_relaxation_time(reference_grid_parameters[1], R1_STATS).squeeze(1, 2)
         grid_t2 = standardized_rate_to_relaxation_time(reference_grid_parameters[2], R2_STATS).squeeze(1, 2)
 
-    pred_t1 = standardized_rate_to_relaxation_time(prediction_parameters[1], R1_STATS).squeeze(1, 2)
-    pred_t2 = standardized_rate_to_relaxation_time(prediction_parameters[2], R2_STATS).squeeze(1, 2)
-    pred_m0 = prediction_parameters[0].squeeze(1, 2).abs()
-    baseline_t1 = standardized_rate_to_relaxation_time(baseline_parameters[1], R1_STATS).squeeze(1, 2)
-    baseline_t2 = standardized_rate_to_relaxation_time(baseline_parameters[2], R2_STATS).squeeze(1, 2)
-    baseline_m0 = baseline_parameters[0].squeeze(1, 2).abs()
+    pred_t1 = standardized_rate_to_relaxation_time(prediction_parameters[1], R1_STATS).squeeze(0, 1, 2)
+    pred_t2 = standardized_rate_to_relaxation_time(prediction_parameters[2], R2_STATS).squeeze(0, 1, 2)
+    pred_m0 = prediction_parameters[0].squeeze(0, 1, 2).abs()
+    baseline_t1 = standardized_rate_to_relaxation_time(baseline_parameters[1], R1_STATS).squeeze(0, 1, 2)
+    baseline_t2 = standardized_rate_to_relaxation_time(baseline_parameters[2], R2_STATS).squeeze(0, 1, 2)
+    baseline_m0 = baseline_parameters[0].squeeze(0, 1, 2).abs()
 
-    ref_t1 = reference_t1_batch.squeeze(1, 2)
-    ref_t2 = reference_t2_batch.squeeze(1, 2)
-    ref_m0 = reference_m0_batch.squeeze(1, 2).abs()
-    grid_m0 = reference_grid_parameters[0].squeeze(1, 2).abs()
+    ref_t1 = reference_t1_batch.squeeze(0, 1, 2)
+    ref_t2 = reference_t2_batch.squeeze(0, 1, 2)
+    ref_m0 = reference_m0_batch.squeeze(0, 1, 2).abs()
+    grid_t1 = grid_t1.squeeze(0)
+    grid_t2 = grid_t2.squeeze(0)
+    grid_m0 = reference_grid_parameters[0].squeeze(0, 1, 2).abs()
+    mask_2d = mask.squeeze(0)
 
-    masked_ref_t1 = ref_t1[mask]
-    masked_ref_t2 = ref_t2[mask]
-    masked_ref_m0 = ref_m0[mask]
-    masked_pred_m0 = pred_m0[mask]
-    masked_baseline_m0 = baseline_m0[mask]
-    masked_grid_m0 = grid_m0[mask]
+    masked_ref_t1 = ref_t1[mask_2d]
+    masked_ref_t2 = ref_t2[mask_2d]
+    masked_ref_m0 = ref_m0[mask_2d]
+    masked_pred_m0 = pred_m0[mask_2d]
+    masked_baseline_m0 = baseline_m0[mask_2d]
+    masked_grid_m0 = grid_m0[mask_2d]
 
     print(f'case={args.case_id} slice={args.slice_index} valid={valid}')
     print(describe('reference_m0_abs', masked_ref_m0))
@@ -205,14 +208,14 @@ def main() -> None:
         f'{tensor_rms(reference_kspace_estimated_csm - scaled_kspace) / max(tensor_rms(scaled_kspace), torch.finfo(torch.float32).eps):.4g}'
     )
     print(
-        f'pred_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(pred_t1[mask], ref_t1[mask])).item():.4g} '
-        f'baseline_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(baseline_t1[mask], ref_t1[mask])).item():.4g} '
-        f'grid_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(grid_t1[mask], ref_t1[mask])).item():.4g}'
+        f'pred_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(pred_t1[mask_2d], ref_t1[mask_2d])).item():.4g} '
+        f'baseline_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(baseline_t1[mask_2d], ref_t1[mask_2d])).item():.4g} '
+        f'grid_t1_rmse={torch.sqrt(torch.nn.functional.mse_loss(grid_t1[mask_2d], ref_t1[mask_2d])).item():.4g}'
     )
     print(
-        f'pred_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(pred_t2[mask], ref_t2[mask])).item():.4g} '
-        f'baseline_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(baseline_t2[mask], ref_t2[mask])).item():.4g} '
-        f'grid_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(grid_t2[mask], ref_t2[mask])).item():.4g}'
+        f'pred_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(pred_t2[mask_2d], ref_t2[mask_2d])).item():.4g} '
+        f'baseline_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(baseline_t2[mask_2d], ref_t2[mask_2d])).item():.4g} '
+        f'grid_t2_rmse={torch.sqrt(torch.nn.functional.mse_loss(grid_t2[mask_2d], ref_t2[mask_2d])).item():.4g}'
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -225,23 +228,23 @@ def main() -> None:
     m0_vmax = float(torch.quantile(masked_ref_m0.float(), 0.99).item())
 
     fig, axes = plt.subplots(4, 5, figsize=(18, 14), constrained_layout=True)
-    plot_panel(axes, 0, 0, ref_t1.squeeze(0), 'Reference T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
-    plot_panel(axes, 0, 1, pred_t1.squeeze(0), 'PINQI T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
-    plot_panel(axes, 0, 2, baseline_t1.squeeze(0), 'Baseline T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
-    plot_panel(axes, 0, 3, grid_t1.squeeze(0), 'Grid-on-final-image T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
-    plot_panel(axes, 0, 4, (pred_t1 - ref_t1).abs().squeeze(0), '|PINQI-Ref| T1', cmap='viridis')
+    plot_panel(axes, 0, 0, ref_t1, 'Reference T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
+    plot_panel(axes, 0, 1, pred_t1, 'PINQI T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
+    plot_panel(axes, 0, 2, baseline_t1, 'Baseline T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
+    plot_panel(axes, 0, 3, grid_t1, 'Grid-on-final-image T1', cmap='magma', vmin=t1_vmin, vmax=t1_vmax)
+    plot_panel(axes, 0, 4, (pred_t1 - ref_t1).abs(), '|PINQI-Ref| T1', cmap='viridis')
 
-    plot_panel(axes, 1, 0, ref_t2.squeeze(0), 'Reference T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
-    plot_panel(axes, 1, 1, pred_t2.squeeze(0), 'PINQI T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
-    plot_panel(axes, 1, 2, baseline_t2.squeeze(0), 'Baseline T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
-    plot_panel(axes, 1, 3, grid_t2.squeeze(0), 'Grid-on-final-image T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
-    plot_panel(axes, 1, 4, (pred_t2 - ref_t2).abs().squeeze(0), '|PINQI-Ref| T2', cmap='viridis')
+    plot_panel(axes, 1, 0, ref_t2, 'Reference T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
+    plot_panel(axes, 1, 1, pred_t2, 'PINQI T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
+    plot_panel(axes, 1, 2, baseline_t2, 'Baseline T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
+    plot_panel(axes, 1, 3, grid_t2, 'Grid-on-final-image T2', cmap='viridis', vmin=t2_vmin, vmax=t2_vmax)
+    plot_panel(axes, 1, 4, (pred_t2 - ref_t2).abs(), '|PINQI-Ref| T2', cmap='viridis')
 
-    plot_panel(axes, 2, 0, ref_m0.squeeze(0), 'Reference |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
-    plot_panel(axes, 2, 1, pred_m0.squeeze(0), 'PINQI |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
-    plot_panel(axes, 2, 2, baseline_m0.squeeze(0), 'Baseline |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
-    plot_panel(axes, 2, 3, grid_m0.squeeze(0), 'Grid-on-final-image |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
-    plot_panel(axes, 2, 4, mask.squeeze(0).float(), 'Mask', cmap='gray', vmin=0.0, vmax=1.0)
+    plot_panel(axes, 2, 0, ref_m0, 'Reference |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
+    plot_panel(axes, 2, 1, pred_m0, 'PINQI |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
+    plot_panel(axes, 2, 2, baseline_m0, 'Baseline |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
+    plot_panel(axes, 2, 3, grid_m0, 'Grid-on-final-image |M0|', cmap='gray', vmin=0.0, vmax=m0_vmax)
+    plot_panel(axes, 2, 4, mask_2d.float(), 'Mask', cmap='gray', vmin=0.0, vmax=1.0)
 
     plot_panel(
         axes,
