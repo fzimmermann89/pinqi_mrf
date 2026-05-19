@@ -1,6 +1,7 @@
 """Tests for signal-model helpers."""
 
 import mr2
+import pytest
 import torch
 
 from pinqi_mrf.parameters import LogRelaxationTransform
@@ -45,3 +46,15 @@ def test_subspace_lookup_shape_and_scaling() -> None:
     assert result.shape == (2, *expected_m0.shape)
     assert result.is_complex()
     torch.testing.assert_close(result, expected_m0.unsqueeze(0) * unit_scale_result)
+
+
+def test_subspace_lookup_rejects_invalid_parameter_ranges() -> None:
+    """SubspaceLookup validates normalized log-time support ranges."""
+    with pytest.raises(ValueError, match='normalized log-time support'):
+        SubspaceLookup(
+            DummyScalingSignalModel(),
+            n_subspace_coefficients=2,
+            parameter_transform=LogRelaxationTransform(bounds=((0.1, 4.0), (0.01, 2.5))),
+            parameter_ranges=((-1.5, 0.5, 4), (-0.5, 0.5, 5)),
+            n_timepoints=2,
+        )
