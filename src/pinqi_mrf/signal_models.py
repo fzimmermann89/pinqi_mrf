@@ -114,6 +114,12 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
     def forward(self, m0: torch.Tensor, *parameters: torch.Tensor) -> tuple[torch.Tensor]:
         """Apply the subspace lookup."""
         parameters = mr2.utils.unsqueeze_tensors_at(*parameters, dim=1, ndim=5)
-        (coefficients,) = self.lookup(*parameters)
+        parameters = torch.broadcast_tensors(*parameters)
+        coefficient_samples = []
+        for sample_parameters in zip(*parameters, strict=True):
+            sample_parameters = tuple(parameter[None] for parameter in sample_parameters)
+            (sample_coefficients,) = self.lookup(*sample_parameters)
+            coefficient_samples.append(sample_coefficients)
+        coefficients = torch.cat(coefficient_samples, dim=1)
         m0 = mr2.utils.unsqueeze_at(m0, dim=min(1, m0.ndim), n=coefficients.ndim - 1 - m0.ndim)
         return (m0 * coefficients,)
