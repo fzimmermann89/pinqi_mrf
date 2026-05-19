@@ -155,3 +155,21 @@ def test_input_normalization_uses_coefficient_norm_percentile() -> None:
     coefficient_norm = torch.linalg.vector_norm(signal, dim=1).reshape(1, -1)
     expected_scale = torch.quantile(coefficient_norm, 0.95, dim=1)
     torch.testing.assert_close(scale, expected_scale)
+
+
+def test_project_parameters_clamps_to_model_support() -> None:
+    """PINQI projection keeps DDM outputs inside configured support."""
+    pinqi = PINQI.__new__(PINQI)
+    pinqi.parameter_ranges = ((-0.5, 0.5, 4), (-0.25, 0.75, 4))
+    parameters = (
+        torch.tensor([3.0 - 4.0j, 0.25 + 0.5j]),
+        torch.tensor([-1.0, 0.25]),
+        torch.tensor([0.5, 1.0]),
+    )
+
+    projected = pinqi.project_parameters(parameters)
+
+    torch.testing.assert_close(projected[0].real, torch.tensor([2.0, 0.25]))
+    torch.testing.assert_close(projected[0].imag, torch.tensor([-2.0, 0.5]))
+    torch.testing.assert_close(projected[1], torch.tensor([-0.5, 0.25]))
+    torch.testing.assert_close(projected[2], torch.tensor([0.5, 0.75]))

@@ -43,6 +43,18 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         super().__init__()
         if len(parameter_ranges) != len(parameter_transform.bounds):
             raise ValueError('parameter_ranges and parameter_transform.bounds must have the same length.')
+        for index, (minimum, maximum, n_steps) in enumerate(parameter_ranges):
+            if minimum >= maximum:
+                raise ValueError(
+                    f'parameter_ranges[{index}] must satisfy minimum < maximum, got ({minimum}, {maximum}).'
+                )
+            if n_steps < 2:
+                raise ValueError(f'parameter_ranges[{index}] must use at least two steps, got {n_steps}.')
+            if minimum < -1.0 or maximum > 1.0:
+                raise ValueError(
+                    f'parameter_ranges[{index}] must stay inside normalized log-time support [-1, 1], '
+                    f'got ({minimum}, {maximum}).'
+                )
         self.parameter_transform = parameter_transform
 
         def simulate_unit_scale(*parameters: torch.Tensor) -> tuple[torch.Tensor]:

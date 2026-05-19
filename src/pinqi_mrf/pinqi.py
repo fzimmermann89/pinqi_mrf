@@ -95,6 +95,7 @@ class PINQI(torch.nn.Module):
         self.use_image_net = use_image_net
         self.use_parameter_net = use_parameter_net
         self.use_dictionary_match = use_dictionary_match
+        self.parameter_ranges = parameter_ranges
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
         self.nonlinear_solver = mr2.operators.DifferentiableDictionaryMatchOp(
             self.signalmodel,
@@ -232,6 +233,17 @@ class PINQI(torch.nn.Module):
         m0 = torch.complex(2.0 * torch.tanh(parameters[0]), 2.0 * torch.tanh(parameters[1]))
         return (m0, *(torch.tanh(parameter) for parameter in parameters[2:].unbind()))
 
+    def project_parameters(self, parameters: ParameterTuple) -> ParameterTuple:
+        """Project reconstructed parameters into the configured model support."""
+        if len(parameters) != len(self.parameter_ranges) + 1:
+            raise RuntimeError('Parameter tuple length must match the configured parameter ranges.')
+        m0 = torch.complex(parameters[0].real.clamp(-2.0, 2.0), parameters[0].imag.clamp(-2.0, 2.0))
+        quantitative = tuple(
+            parameter.clamp(minimum, maximum)
+            for parameter, (minimum, maximum, _n_steps) in zip(parameters[1:], self.parameter_ranges, strict=True)
+        )
+        return (m0, *quantitative)
+
     def get_image_reg(self, image: torch.Tensor, iteration: int) -> torch.Tensor:
         """Predict image-space prior from the current image estimate."""
         batch = image.shape[0]
@@ -309,6 +321,8 @@ class PINQI(torch.nn.Module):
                 )
             if not self.use_parameter_net:
                 parameter, signal = self.nonlinear_solver(images[-1].swapaxes(0, 1), return_signal=True)
+                parameter = self.project_parameters(parameter)
+                (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             elif self.use_dictionary_match:
                 if parameter_reg is None:
@@ -319,11 +333,13 @@ class PINQI(torch.nn.Module):
                     prior_precision=tuple(lambda_parameters),
                     return_signal=True,
                 )
+                parameter = self.project_parameters(parameter)
+                (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             else:
                 if parameter_reg is None:
                     raise RuntimeError('Direct parameter prediction requires use_parameter_net=True.')
-                parameter = parameter_reg
+                parameter = self.project_parameters(parameter_reg)
                 (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             parameters.append(parameter)
