@@ -234,7 +234,6 @@ class PINQI(torch.nn.Module):
         m0 = torch.complex(2.0 * torch.tanh(parameters[0]), 2.0 * torch.tanh(parameters[1]))
         return (m0, *(torch.tanh(parameter) for parameter in parameters[2:].unbind()))
 
-    @torch.compile
     def project_parameters(self, parameters: ParameterTuple) -> ParameterTuple:
         """Project reconstructed parameters into the configured model support."""
         if len(parameters) != len(self.parameter_ranges) + 1:
