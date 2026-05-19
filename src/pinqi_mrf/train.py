@@ -19,18 +19,13 @@ from mr2.utils.sliding_window import sliding_window
 from pinqi_mrf.acquisition import AcquisitionData, create_radial_trajectory
 from pinqi_mrf.data import BatchType, DelicsRadialReferenceBatch, ValidationLoaderType
 from pinqi_mrf.losses import ssim_loss
-from pinqi_mrf.parameters import (
-    R1_STATS,
-    R2_STATS,
-    relaxation_time_to_standardized_rate,
-    standardized_rate_to_relaxation_time,
-)
+from pinqi_mrf.parameters import LogRelaxationTransform
 from pinqi_mrf.pinqi import PINQI, BaselineReconstruction, ParameterTuple
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
 
-MIN_SUPERVISED_T1 = 0.3
-MIN_SUPERVISED_T2 = 0.03
+MIN_SUPERVISED_T1 = 0.1
+MIN_SUPERVISED_T2 = 0.01
 T1_DISPLAY_RANGE = (0.0, 2.0)
 T2_DISPLAY_RANGE = (0.020, 0.150)
 
@@ -120,8 +115,8 @@ class BaseModule(pl.LightningModule):
         n_coils: int = 12,  # noqa: ARG002
         n_compressed_coils: int | None = 8,  # noqa: ARG002
         n_timepoints: int | None = None,
-        parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        relaxation_bounds: tuple[tuple[float, float], ...] = ((0.1, 4.0), (0.01, 2.5)),
+        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-0.995, 0.995, 240), (-0.995, 0.995, 200)),
         trajectory: str = 'radial',
         use_density_compensation: bool = False,  # noqa: ARG002
         weight_scaling: bool = True,
@@ -154,10 +149,11 @@ class BaseModule(pl.LightningModule):
         """Initialize the shared reconstruction state."""
         super().__init__()
         self.save_hyperparameters(ignore=['signalmodel'])
+        self.parameter_transform = LogRelaxationTransform(bounds=relaxation_bounds)
         self.signalmodel = SubspaceLookup(
             signalmodel=signalmodel or mr2.operators.models.NeuroMRF(),
             n_subspace_coefficients=n_subspace_coefficients,
-            parameter_stats=parameter_stats,
+            parameter_transform=self.parameter_transform,
             parameter_ranges=parameter_ranges,
             n_timepoints=n_timepoints,
         )
@@ -350,7 +346,7 @@ class BaseModule(pl.LightningModule):
         predictions: Sequence[ParameterTuple],
         batch: BatchType,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute supervised synthetic parameter loss in standardized parameter space."""
+        """Compute supervised synthetic parameter loss in normalized log-time space."""
         components = {
             'base': torch.tensor(0.0, device=self.device),
             'l1': torch.tensor(0.0, device=self.device),
@@ -358,13 +354,11 @@ class BaseModule(pl.LightningModule):
         }
         target_parameters = self._parameters_from_batch(batch)
         if len(target_parameters) < 3:
-            raise RuntimeError('Synthetic supervision currently expects at least m0, r1, and r2 target parameters.')
-        target_r1 = target_parameters[1]
-        target_r2 = target_parameters[2]
+            raise RuntimeError('Synthetic supervision currently expects at least m0, T1, and T2 target parameters.')
         mask = batch['mask'].bool()
-        target_t1 = standardized_rate_to_relaxation_time(target_r1, R1_STATS)
-        target_t2 = standardized_rate_to_relaxation_time(target_r2, R2_STATS)
-        parameter_mask = self._parameter_mask(mask, target_r1, target_r2, target_t1, target_t2)
+        target_t1 = batch['t1']
+        target_t2 = batch['t2']
+        parameter_mask = self._parameter_mask(mask, target_t1, target_t2)
         final_iteration = len(predictions) - 1
         for iteration, (prediction, weight) in enumerate(zip(predictions, self.hparams.loss_weights, strict=True)):
             prediction_parameters = tuple(parameter.squeeze(1, 2) for parameter in prediction)
@@ -388,7 +382,7 @@ class BaseModule(pl.LightningModule):
                 sum(parameter_losses, start=torch.zeros((), device=self.device)) + 0.1 * loss_outside
             )
             if iteration == final_iteration:
-                component_names = ('m0', 'r1', 'r2')
+                component_names = ('m0', 't1', 't2')
                 for parameter_index, parameter_loss in enumerate(parameter_losses):
                     name = (
                         component_names[parameter_index]
@@ -418,16 +412,17 @@ class BaseModule(pl.LightningModule):
                     prediction_quantitative_parameters,
                     target_quantitative_parameters,
                     parameter_mask,
+                    clamp=(-1.0, 1.0),
                 )
         loss = (
             components['base'] + self.hparams.loss_l1 * components['l1'] + self.hparams.loss_ssim * components['ssim']
         )
         return loss, components
 
-    @staticmethod
-    def _parameters_from_batch(batch: BatchType) -> ParameterTuple:
+    def _parameters_from_batch(self, batch: BatchType) -> ParameterTuple:
         """Extract the ordered parameter tuple from a synthetic batch."""
-        return (batch['m0'], batch['r1'], batch['r2'])
+        t1, t2 = self.parameter_transform.physical_to_normalized(batch['t1'], batch['t2'])
+        return (batch['m0'], t1, t2)
 
     def build_coil_rhs(
         self,
@@ -578,25 +573,25 @@ class BaseModule(pl.LightningModule):
     ) -> ParameterValidationResult:
         """Evaluate reconstruction quality against reference T1/T2 maps."""
         if len(prediction_parameters) < 3 or len(baseline_parameters) < 3:
-            raise RuntimeError('Validation currently expects at least m0, r1, and r2 reconstruction outputs.')
+            raise RuntimeError('Validation currently expects at least m0, T1, and T2 reconstruction outputs.')
         target_t1 = reference_t1
         target_t2 = reference_t2
-        target_r1 = relaxation_time_to_standardized_rate(target_t1, R1_STATS)
-        target_r2 = relaxation_time_to_standardized_rate(target_t2, R2_STATS)
 
-        pred_t1 = standardized_rate_to_relaxation_time(prediction_parameters[1], R1_STATS)
-        pred_t2 = standardized_rate_to_relaxation_time(prediction_parameters[2], R2_STATS)
-        baseline_t1 = standardized_rate_to_relaxation_time(baseline_parameters[1], R1_STATS)
-        baseline_t2 = standardized_rate_to_relaxation_time(baseline_parameters[2], R2_STATS)
+        pred_t1, pred_t2 = self.parameter_transform.normalized_to_physical(
+            prediction_parameters[1],
+            prediction_parameters[2],
+        )
+        baseline_t1, baseline_t2 = self.parameter_transform.normalized_to_physical(
+            baseline_parameters[1],
+            baseline_parameters[2],
+        )
 
-        target_r1_map = target_r1.squeeze(1, 2)
-        target_r2_map = target_r2.squeeze(1, 2)
         target_t1_map = target_t1.squeeze(1, 2)
         target_t2_map = target_t2.squeeze(1, 2)
         if apply_parameter_thresholds:
-            metric_mask = self._parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
+            metric_mask = self._parameter_mask(mask, target_t1_map, target_t2_map)
         else:
-            metric_mask = self._finite_parameter_mask(mask, target_r1_map, target_r2_map, target_t1_map, target_t2_map)
+            metric_mask = self._finite_parameter_mask(mask, target_t1_map, target_t2_map)
         return ParameterValidationResult(
             t1=self._evaluate_relaxation_time_validation(
                 target_t1,
@@ -691,8 +686,8 @@ class BaseModule(pl.LightningModule):
         baseline_parameters = self.baseline(rhs, normal_op)
         mask = batch['mask'].bool()
         batch_size = len(mask)
-        target_t1 = standardized_rate_to_relaxation_time(batch['r1'][:, None, None], R1_STATS)
-        target_t2 = standardized_rate_to_relaxation_time(batch['r2'][:, None, None], R2_STATS)
+        target_t1 = batch['t1'][:, None, None]
+        target_t2 = batch['t2'][:, None, None]
         result = self.evaluate_parameter_validation(
             prediction_parameters,
             baseline_parameters,
@@ -704,8 +699,7 @@ class BaseModule(pl.LightningModule):
         pred_t2_masked = result.t2.prediction.squeeze(1, 2)[metric_mask]
         baseline_t2_masked = result.t2.baseline.squeeze(1, 2)[metric_mask]
         target_t2_masked = result.t2.target.squeeze(1, 2)[metric_mask]
-        pred_r2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
-        pred_r2_rate_masked = pred_r2_masked * R2_STATS[1] + R2_STATS[0]
+        pred_q_t2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
         self.log(
             f'{prefix}/ssim_t1',
             result.t1.ssim,
@@ -735,8 +729,8 @@ class BaseModule(pl.LightningModule):
                 f'debug/{prefix}/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
                 f'debug/{prefix}/baseline_t2_abs_max': baseline_t2_masked.abs().amax(),
                 f'debug/{prefix}/target_t2_abs_max': target_t2_masked.abs().amax(),
-                f'debug/{prefix}/pred_r2_min': pred_r2_masked.amin(),
-                f'debug/{prefix}/pred_r2_rate_min': pred_r2_rate_masked.amin(),
+                f'debug/{prefix}/pred_q_t2_min': pred_q_t2_masked.amin(),
+                f'debug/{prefix}/pred_q_t2_max': pred_q_t2_masked.amax(),
                 f'debug/{prefix}/pred_t2_invalid_fraction': (~torch.isfinite(pred_t2_masked)).float().mean(),
                 f'debug/{prefix}/pred_t2_gt_display_max_fraction': (
                     pred_t2_masked > T2_DISPLAY_RANGE[1]
@@ -809,16 +803,12 @@ class BaseModule(pl.LightningModule):
     @staticmethod
     def _parameter_mask(
         mask: torch.Tensor,
-        target_r1: torch.Tensor,
-        target_r2: torch.Tensor,
         target_t1: torch.Tensor,
         target_t2: torch.Tensor,
     ) -> torch.Tensor:
         """Return the mask used for supervised parameter metrics."""
         return (
             mask
-            & torch.isfinite(target_r1)
-            & torch.isfinite(target_r2)
             & torch.isfinite(target_t1)
             & torch.isfinite(target_t2)
             & (target_t1 >= MIN_SUPERVISED_T1)
@@ -828,19 +818,11 @@ class BaseModule(pl.LightningModule):
     @staticmethod
     def _finite_parameter_mask(
         mask: torch.Tensor,
-        target_r1: torch.Tensor,
-        target_r2: torch.Tensor,
         target_t1: torch.Tensor,
         target_t2: torch.Tensor,
     ) -> torch.Tensor:
         """Return the mask used for validation metrics without parameter-range thresholding."""
-        return (
-            mask
-            & torch.isfinite(target_r1)
-            & torch.isfinite(target_r2)
-            & torch.isfinite(target_t1)
-            & torch.isfinite(target_t2)
-        )
+        return mask & torch.isfinite(target_t1) & torch.isfinite(target_t2)
 
     def _log_relaxation_time_figure(
         self,

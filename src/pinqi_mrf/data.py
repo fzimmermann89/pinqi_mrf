@@ -13,8 +13,6 @@ import mr2
 import torch
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
-from pinqi_mrf.parameters import R1_STATS, R2_STATS, relaxation_time_to_standardized_rate
-
 BRAINWEB_VALUES_3T_RANDOMIZED = {
     'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.05), (-0.2, 0.2)),
     'gry': mr2.phantoms.brainweb.BrainwebTissue((1.200, 2.000), (0.080, 0.120), (0.70, 1.00), (-0.2, 0.2)),
@@ -34,8 +32,8 @@ class BatchType(TypedDict):
     """Type hint for a batch of data."""
 
     m0: torch.Tensor
-    r1: torch.Tensor
-    r2: torch.Tensor
+    t1: torch.Tensor
+    t2: torch.Tensor
     csm: torch.Tensor
     mask: torch.Tensor
     noise_std: torch.Tensor
@@ -87,7 +85,7 @@ class DelicsRadialDataset(
         *,
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
-        delics_scale: float = 250.0,
+        delics_scale: float = 1.0,
         delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[False] = False,
@@ -100,7 +98,7 @@ class DelicsRadialDataset(
         *,
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
-        delics_scale: float = 250.0,
+        delics_scale: float = 1.0,
         delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[True],
@@ -112,7 +110,7 @@ class DelicsRadialDataset(
         *,
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
-        delics_scale: float = 250.0,
+        delics_scale: float = 1.0,
         delics_noise_std: float = 2e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: IncludeReferences = False,
@@ -189,7 +187,7 @@ class DelicsRadialDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
+        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace_new'),
         *,
         train_case_ids: Sequence[str] | None = None,
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
@@ -274,8 +272,8 @@ class BrainwebDataset(torch.utils.data.Dataset):
         size: int = 256,
         n_coils: int = 12,
         noise: tuple[float, float] = (0.0, 0.05),
-        r1_stats: tuple[float, float] = R1_STATS,
-        r2_stats: tuple[float, float] = R2_STATS,
+        t1_bounds: tuple[float, float] = (0.1, 4.0),
+        t2_bounds: tuple[float, float] = (0.01, 2.5),
         orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
         bias_field_downsample_factor: int = 16,
         m0_bias_range: tuple[float, float] = (0.8, 1.2),
@@ -311,8 +309,8 @@ class BrainwebDataset(torch.utils.data.Dataset):
         self.matrix_size = mr2.data.SpatialDimension(1, size, size)
         self.n_coils = n_coils
         self.noise = noise
-        self.r1_stats = r1_stats
-        self.r2_stats = r2_stats
+        self.t1_bounds = t1_bounds
+        self.t2_bounds = t2_bounds
         self.bias_field_downsample_factor = bias_field_downsample_factor
         self.m0_bias_range = m0_bias_range
         self.t1_bias_range = t1_bias_range
@@ -376,8 +374,8 @@ class BrainwebDataset(torch.utils.data.Dataset):
 
         return {
             'm0': m0,
-            'r1': relaxation_time_to_standardized_rate(t1, self.r1_stats),
-            'r2': relaxation_time_to_standardized_rate(t2, self.r2_stats),
+            't1': t1.clamp(*self.t1_bounds),
+            't2': t2.clamp(*self.t2_bounds),
             'csm': mr2.phantoms.coils.birdcage_2d(
                 self.n_coils,
                 self.matrix_size,
@@ -397,14 +395,14 @@ class DataModule(pl.LightningDataModule):
         self,
         folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         *,
-        delics_folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
+        delics_folder: Path = Path('/scratch/zimmer08/delics/radial_kspace_new'),
         delics_val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         delics_case_glob: str = 'delics_radial_case*.h5',
         size: int = 256,
         n_coils: int = 12,
         noise: tuple[float, float] = (0.0, 0.05),
-        r1_stats: tuple[float, float] = R1_STATS,
-        r2_stats: tuple[float, float] = R2_STATS,
+        t1_bounds: tuple[float, float] = (0.1, 4.0),
+        t2_bounds: tuple[float, float] = (0.01, 2.5),
         batch_size: int = 6,
         num_workers: int = 4,
     ) -> None:
@@ -418,8 +416,8 @@ class DataModule(pl.LightningDataModule):
         self.size = size
         self.n_coils = n_coils
         self.noise = noise
-        self.r1_stats = r1_stats
-        self.r2_stats = r2_stats
+        self.t1_bounds = t1_bounds
+        self.t2_bounds = t2_bounds
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.synthetic_val_dataset: torch.utils.data.Subset[BrainwebDataset] | None = None
@@ -437,8 +435,8 @@ class DataModule(pl.LightningDataModule):
             size=self.size,
             n_coils=self.n_coils,
             noise=self.noise,
-            r1_stats=self.r1_stats,
-            r2_stats=self.r2_stats,
+            t1_bounds=self.t1_bounds,
+            t2_bounds=self.t2_bounds,
             orientation=orientation,
             random=random,
         )
@@ -567,13 +565,13 @@ class PretrainDataModule(DataModule):
         self,
         folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         *,
-        delics_val_folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
+        delics_val_folder: Path = Path('/scratch/zimmer08/delics/radial_kspace_new'),
         delics_val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         size: int = 256,
         n_coils: int = 12,
         noise: tuple[float, float] = (0.0, 0.05),
-        r1_stats: tuple[float, float] = R1_STATS,
-        r2_stats: tuple[float, float] = R2_STATS,
+        t1_bounds: tuple[float, float] = (0.1, 4.0),
+        t2_bounds: tuple[float, float] = (0.01, 2.5),
         batch_size: int = 6,
         num_workers: int = 4,
         delics_val_case_glob: str = 'delics_radial_case*.h5',
@@ -587,8 +585,8 @@ class PretrainDataModule(DataModule):
             size=size,
             n_coils=n_coils,
             noise=noise,
-            r1_stats=r1_stats,
-            r2_stats=r2_stats,
+            t1_bounds=t1_bounds,
+            t2_bounds=t2_bounds,
             batch_size=batch_size,
             num_workers=num_workers,
         )
@@ -622,7 +620,7 @@ class FineTuneDataModule(DataModule):
 
     def __init__(
         self,
-        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace'),
+        folder: Path = Path('/scratch/zimmer08/delics/radial_kspace_new'),
         *,
         val_case_ids: Sequence[str] = ('case000', 'case007', 'case100'),
         train_case_ids: Sequence[str] | None = None,
@@ -634,8 +632,8 @@ class FineTuneDataModule(DataModule):
         brainweb_size: int = 256,
         brainweb_n_coils: int = 12,
         brainweb_noise: tuple[float, float] = (0.0, 0.05),
-        brainweb_r1_stats: tuple[float, float] = R1_STATS,
-        brainweb_r2_stats: tuple[float, float] = R2_STATS,
+        brainweb_t1_bounds: tuple[float, float] = (0.1, 4.0),
+        brainweb_t2_bounds: tuple[float, float] = (0.01, 2.5),
         val_batch_size: int = 6,
         val_num_workers: int = 0,
     ) -> None:
@@ -648,8 +646,8 @@ class FineTuneDataModule(DataModule):
             size=brainweb_size,
             n_coils=brainweb_n_coils,
             noise=brainweb_noise,
-            r1_stats=brainweb_r1_stats,
-            r2_stats=brainweb_r2_stats,
+            t1_bounds=brainweb_t1_bounds,
+            t2_bounds=brainweb_t2_bounds,
             batch_size=val_batch_size,
             num_workers=val_num_workers,
         )

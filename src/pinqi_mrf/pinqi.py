@@ -35,6 +35,7 @@ class PINQI(torch.nn.Module):
         n_iterations: int,
         n_features_parameter_net: Sequence[int],
         n_features_image_net: Sequence[int],
+        parameter_ranges: tuple[tuple[float, float, int], ...],
         csm_refinement_iterations: tuple[int, ...] = (),
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
@@ -43,7 +44,6 @@ class PINQI(torch.nn.Module):
         initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
         image_cg_tolerance: float = 1e-5,
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
         nonlinear_solver_batch_size: int = 8192,
         weight_scaling: bool = False,
         normalize_inputs: bool = False,
@@ -229,7 +229,8 @@ class PINQI(torch.nn.Module):
             parameters = self.parameter_net(image_real.contiguous(), cond=cond)
         parameters = parameters.float()
         parameters = einops.rearrange(parameters, 'batch parameters y x -> parameters batch 1 1 y x')
-        return (torch.complex(parameters[0], parameters[1]), *parameters[2:].unbind())
+        m0 = torch.complex(2.0 * torch.tanh(parameters[0]), 2.0 * torch.tanh(parameters[1]))
+        return (m0, *(torch.tanh(parameter) for parameter in parameters[2:].unbind()))
 
     def get_image_reg(self, image: torch.Tensor, iteration: int) -> torch.Tensor:
         """Predict image-space prior from the current image estimate."""
@@ -347,7 +348,7 @@ class BaselineReconstruction(torch.nn.Module):
     def __init__(
         self,
         signalmodel: mr2.operators.SignalModel,
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        parameter_ranges: tuple[tuple[float, float, int], ...],
         nonlinear_solver_batch_size: int = 8192,
     ) -> None:
         """Initialize the baseline reconstruction."""

@@ -34,11 +34,11 @@ def test_delics_radial_dataset_returns_training_fields_only(tmp_path: Path) -> N
     sample = dataset[0]
 
     assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask'}
-    assert sample['case_id'] == 'case001'
+    assert sample['case_id'].item() == 0
     assert sample['slice_index'].item() == 0
     assert sample['kspace'].shape == (3, 4, 1, 1, 5)
     assert sample['kspace'].dtype == torch.complex64
-    torch.testing.assert_close(sample['kspace'], torch.full((3, 4, 1, 1, 5), 250.0 + 0.0j, dtype=torch.complex64))
+    torch.testing.assert_close(sample['kspace'], torch.full((3, 4, 1, 1, 5), 1.0 + 0.0j, dtype=torch.complex64))
     assert sample['mask'].shape == (6, 7)
     assert len(dataset) == 1
 
@@ -50,7 +50,7 @@ def test_delics_radial_dataset_noise_is_deterministic(tmp_path: Path) -> None:
     dataset = DelicsRadialDataset(tmp_path)
     sample_a = dataset[0]
     sample_b = dataset[0]
-    reference = torch.full((3, 4, 1, 1, 5), 250.0 + 0.0j, dtype=torch.complex64)
+    reference = torch.full((3, 4, 1, 1, 5), 1.0 + 0.0j, dtype=torch.complex64)
 
     torch.testing.assert_close(sample_a['kspace'], sample_b['kspace'])
     assert (sample_a['kspace'] - reference).abs().amax() > 0
@@ -96,8 +96,8 @@ def test_delics_radial_datamodule_filters_case_ids(tmp_path: Path) -> None:
     assert val_loader is not None
     val_batch = next(iter(val_loader))
 
-    assert train_batch['case_id'] == ['case001']
-    assert val_batch['case_id'] == ['case002']
+    torch.testing.assert_close(train_batch['case_id'], torch.tensor([0]))
+    torch.testing.assert_close(val_batch['case_id'], torch.tensor([0]))
     assert train_batch['kspace'].shape == (1, 3, 4, 1, 1, 5)
     assert 'reference_t1' not in train_batch
     assert 'reference_t2' not in train_batch

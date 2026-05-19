@@ -402,6 +402,13 @@ def convert_all(config: ConversionConfig, *, num_workers: int = 1) -> list[Path]
         raise FileNotFoundError(f'No files matching {config.case_glob!r} found in {config.input_root}.')
     if num_workers < 1:
         raise ValueError('num_workers must be at least 1.')
+    for source_path in source_files:
+        with h5py.File(source_path, 'r') as source:
+            validate_source(source, source_path)
+            case = source_case_id(source_path, source)
+        output_path = config.output_root / f'delics_radial_{case}.h5'
+        if output_path.exists() and not config.overwrite:
+            raise FileExistsError(f'{output_path} already exists. Use --overwrite to replace it.')
     if not torch.cuda.is_available():
         raise RuntimeError('DELICS conversion requires CUDA.')
     n_gpus = torch.cuda.device_count()
