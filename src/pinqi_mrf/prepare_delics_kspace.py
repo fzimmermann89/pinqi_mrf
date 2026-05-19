@@ -25,7 +25,7 @@ N_COMPRESSED_COILS = 8
 DELICS_KSPACE_SCALE = 250.0
 DEFAULT_INPUT_ROOT = Path('/scratch/zimmer08/delics')
 DEFAULT_OUTPUT_FOLDER = 'radial_kspace_new'
-DEFAULT_DICTIONARY_BATCH_SIZE = 8192
+DEFAULT_DICTIONARY_BATCH_SIZE = 1024
 DEFAULT_THREADS_PER_WORKER = 16
 
 
@@ -383,14 +383,18 @@ def find_source_files(input_root: Path, case_glob: str) -> list[Path]:
     return sorted(path for path in input_root.glob(case_glob) if path.is_file())
 
 
-def convert_file_on_gpu(task: tuple[Path, ConversionConfig, int, int]) -> Path:
-    """Convert one source file in a spawned worker process."""
-    source_path, config, gpu_index, position = task
+def convert_files_on_gpu(task: tuple[list[Path], ConversionConfig, int, int]) -> list[Path]:
+    """Convert a shard of source files in one GPU-pinned worker process."""
+    source_paths, config, gpu_index, position = task
     _ = position
     configure_worker_threads(config.threads_per_worker)
     torch.cuda.set_device(gpu_index)
     device = torch.device(f'cuda:{gpu_index}')
-    return convert_file(source_path, config.output_root, config=config, device=device)
+    outputs = []
+    for source_path in source_paths:
+        outputs.append(convert_file(source_path, config.output_root, config=config, device=device))
+        torch.cuda.empty_cache()
+    return outputs
 
 
 def convert_all(config: ConversionConfig, *, num_workers: int = 1) -> list[Path]:
@@ -425,20 +429,17 @@ def convert_all(config: ConversionConfig, *, num_workers: int = 1) -> list[Path]
         return outputs
 
     tasks = [
-        (source_path, config, task_index % n_gpus, task_index % num_workers + 1)
-        for task_index, source_path in enumerate(source_files)
+        (source_files[worker_index::num_workers], config, worker_index, worker_index + 1)
+        for worker_index in range(num_workers)
+        if source_files[worker_index::num_workers]
     ]
     outputs = []
     context = mp.get_context('spawn')
     with context.Pool(processes=num_workers) as pool:
-        for output in tqdm(
-            pool.imap_unordered(convert_file_on_gpu, tasks),
-            total=len(tasks),
-            desc='DELICS files',
-            unit='file',
-            position=0,
-        ):
-            outputs.append(output)
+        with tqdm(total=len(source_files), desc='DELICS files', unit='file', position=0) as progress:
+            for worker_outputs in pool.imap_unordered(convert_files_on_gpu, tasks):
+                outputs.extend(worker_outputs)
+                progress.update(len(worker_outputs))
     return outputs
 
 
