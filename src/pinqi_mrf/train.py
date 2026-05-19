@@ -139,7 +139,7 @@ class BaseModule(pl.LightningModule):
         image_cg_tolerance: float = 1e-5,
         n_features_parameter_net: Sequence[int] = (64, 128, 192, 256),
         n_features_image_net: Sequence[int] = (48, 64, 96, 128),
-        nonlinear_solver_batch_size: int = 4096,
+        nonlinear_solver_batch_size: int = 8192,
         lr: float = 3.0e-4,  # noqa: ARG002
         weight_decay: float = 1e-3,  # noqa: ARG002
         loss_weights: Sequence[float] = (0.2, 0.1, 0.1, 0.8),  # noqa: ARG002
