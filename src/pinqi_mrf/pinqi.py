@@ -44,7 +44,7 @@ class PINQI(torch.nn.Module):
         initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
         image_cg_tolerance: float = 1e-5,
-        nonlinear_solver_batch_size: int = 8192,
+        nonlinear_solver_batch_size: int = 4096,
         weight_scaling: bool = False,
         normalize_inputs: bool = False,
         use_image_net: bool = True,
@@ -219,6 +219,7 @@ class PINQI(torch.nn.Module):
         scale = torch.quantile(flattened_norm, 0.95, dim=1)
         return scale.clamp_min(1e-8)
 
+    @torch.compile
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> ParameterTuple:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
@@ -233,6 +234,7 @@ class PINQI(torch.nn.Module):
         m0 = torch.complex(2.0 * torch.tanh(parameters[0]), 2.0 * torch.tanh(parameters[1]))
         return (m0, *(torch.tanh(parameter) for parameter in parameters[2:].unbind()))
 
+    @torch.compile
     def project_parameters(self, parameters: ParameterTuple) -> ParameterTuple:
         """Project reconstructed parameters into the configured model support."""
         if len(parameters) != len(self.parameter_ranges) + 1:
@@ -244,6 +246,7 @@ class PINQI(torch.nn.Module):
         )
         return (m0, *quantitative)
 
+    @torch.compile
     def get_image_reg(self, image: torch.Tensor, iteration: int) -> torch.Tensor:
         """Predict image-space prior from the current image estimate."""
         batch = image.shape[0]
@@ -320,18 +323,17 @@ class PINQI(torch.nn.Module):
                     )
                 )
             if not self.use_parameter_net:
-                parameter, signal = self.nonlinear_solver(images[-1].swapaxes(0, 1), return_signal=True)
+                parameter = self.nonlinear_solver(images[-1].swapaxes(0, 1))
                 parameter = self.project_parameters(parameter)
                 (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             elif self.use_dictionary_match:
                 if parameter_reg is None:
                     raise RuntimeError('Parameter prior is required when use_parameter_net=True.')
-                parameter, signal = self.nonlinear_solver(
+                parameter = self.nonlinear_solver(
                     images[-1].swapaxes(0, 1),
                     prior=parameter_reg,
                     prior_precision=tuple(lambda_parameters),
-                    return_signal=True,
                 )
                 parameter = self.project_parameters(parameter)
                 (signal,) = self.signalmodel(*parameter)
@@ -365,7 +367,7 @@ class BaselineReconstruction(torch.nn.Module):
         self,
         signalmodel: mr2.operators.SignalModel,
         parameter_ranges: tuple[tuple[float, float, int], ...],
-        nonlinear_solver_batch_size: int = 8192,
+        nonlinear_solver_batch_size: int = 4096,
     ) -> None:
         """Initialize the baseline reconstruction."""
         super().__init__()

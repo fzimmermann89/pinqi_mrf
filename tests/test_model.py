@@ -160,6 +160,7 @@ def test_input_normalization_uses_coefficient_norm_percentile() -> None:
 def test_project_parameters_clamps_to_model_support() -> None:
     """PINQI projection keeps DDM outputs inside configured support."""
     pinqi = PINQI.__new__(PINQI)
+    torch.nn.Module.__init__(pinqi)
     pinqi.parameter_ranges = ((-0.5, 0.5, 4), (-0.25, 0.75, 4))
     parameters = (
         torch.tensor([3.0 - 4.0j, 0.25 + 0.5j]),
