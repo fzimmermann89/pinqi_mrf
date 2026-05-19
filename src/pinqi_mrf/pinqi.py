@@ -320,20 +320,19 @@ class PINQI(torch.nn.Module):
                     )
                 )
             if not self.use_parameter_net:
-                parameter = self.nonlinear_solver(images[-1].swapaxes(0, 1))
+                parameter, signal = self.nonlinear_solver(images[-1].swapaxes(0, 1), return_signal=True)
                 parameter = self.project_parameters(parameter)
-                (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             elif self.use_dictionary_match:
                 if parameter_reg is None:
                     raise RuntimeError('Parameter prior is required when use_parameter_net=True.')
-                parameter = self.nonlinear_solver(
+                parameter, signal = self.nonlinear_solver(
                     images[-1].swapaxes(0, 1),
                     prior=parameter_reg,
                     prior_precision=tuple(lambda_parameters),
+                    return_signal=True,
                 )
                 parameter = self.project_parameters(parameter)
-                (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
             else:
                 if parameter_reg is None:
