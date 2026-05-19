@@ -359,16 +359,17 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
                 target['csm_initial'][z] = csm
                 target['csm_valid'][z] = csm_valid
                 reference_m0, reference_t1, reference_t2 = dictionary_match_reference(frames, csm, dictionary_match)
-                target['reference_m0'][z] = reference_m0
+                target['reference_m0'][z] = (DELICS_KSPACE_SCALE * reference_m0).astype(np.complex64)
                 target['reference_t1'][z] = reference_t1
                 target['reference_t2'][z] = reference_t2
 
             reference_m0_abs = np.abs(target['reference_m0'][()])
+            initially_valid = target['valid'][()] & target['csm_valid'][()]
             central_reference_m0 = reference_m0_abs[5:-20]
             if central_reference_m0.size == 0:
                 central_reference_m0 = reference_m0_abs
             threshold = np.percentile(central_reference_m0, 90) * 0.05
-            good = (reference_m0_abs > threshold).mean(axis=(-1, -2)) > 0.1
+            good = initially_valid & ((reference_m0_abs > threshold).mean(axis=(-1, -2)) > 0.1)
             if good.any():
                 good[: np.argmax(good) + 8] = False
             target['valid'][:] = good
