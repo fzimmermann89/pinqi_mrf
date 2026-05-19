@@ -219,7 +219,6 @@ class PINQI(torch.nn.Module):
         scale = torch.quantile(flattened_norm, 0.95, dim=1)
         return scale.clamp_min(1e-8)
 
-    @torch.compile
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> ParameterTuple:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
@@ -245,7 +244,6 @@ class PINQI(torch.nn.Module):
         )
         return (m0, *quantitative)
 
-    @torch.compile
     def get_image_reg(self, image: torch.Tensor, iteration: int) -> torch.Tensor:
         """Predict image-space prior from the current image estimate."""
         batch = image.shape[0]
