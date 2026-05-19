@@ -6,6 +6,7 @@ import mr2
 import torch
 
 
+@torch.compile
 def charbonnier_loss(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -21,6 +22,7 @@ def charbonnier_loss(
     return loss
 
 
+@torch.compile
 def ssim_loss(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
