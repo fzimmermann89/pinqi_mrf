@@ -44,7 +44,7 @@ class PINQI(torch.nn.Module):
         initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
         image_cg_tolerance: float = 1e-5,
-        nonlinear_solver_batch_size: int = 4096,
+        nonlinear_solver_batch_size: int = 8192,
         weight_scaling: bool = False,
         normalize_inputs: bool = False,
         use_image_net: bool = True,
@@ -363,7 +363,7 @@ class BaselineReconstruction(torch.nn.Module):
         self,
         signalmodel: mr2.operators.SignalModel,
         parameter_ranges: tuple[tuple[float, float, int], ...],
-        nonlinear_solver_batch_size: int = 4096,
+        nonlinear_solver_batch_size: int = 8192,
     ) -> None:
         """Initialize the baseline reconstruction."""
         super().__init__()
