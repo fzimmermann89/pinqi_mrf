@@ -3,6 +3,7 @@
 import mr2
 import torch
 
+from pinqi_mrf.parameters import LogRelaxationTransform
 from pinqi_mrf.signal_models import SubspaceLookup
 
 
@@ -27,7 +28,7 @@ def test_subspace_lookup_shape_and_scaling() -> None:
     signalmodel = SubspaceLookup(
         DummyScalingSignalModel(),
         n_subspace_coefficients=2,
-        parameter_stats=((1.0, 0.5), (5.0, 2.0)),
+        parameter_transform=LogRelaxationTransform(bounds=((0.1, 4.0), (0.01, 2.5))),
         parameter_ranges=((-0.5, 0.5, 4), (-0.5, 0.5, 5)),
         n_timepoints=2,
     )

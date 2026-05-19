@@ -14,19 +14,11 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 
 from pinqi_mrf.acquisition import AcquisitionData
 from pinqi_mrf.data import BatchType, DelicsRadialBatch, FineTuneBatch
-from pinqi_mrf.parameters import (
-    R1_STATS,
-    R2_STATS,
-    relaxation_time_to_standardized_rate,
-    standardized_rate_to_relaxation_time,
-)
 from pinqi_mrf.pinqi import ParameterTuple
-from pinqi_mrf.train import BaseModule, FineTuneHParams, MIN_SUPERVISED_T1, MIN_SUPERVISED_T2
+from pinqi_mrf.train import BaseModule, FineTuneHParams
 
 TEACHER_GAMMA_RANGE = (0.8, 1.2)
 TEACHER_MAX_GLOBAL_SHIFT = 0.1
-MAX_TEACHER_T1 = 3.0
-MAX_TEACHER_T2 = 2.0
 
 
 @dataclass(frozen=True)
@@ -326,22 +318,9 @@ class FineTuneModule(BaseModule):
                 dim=-1,
                 n=target.ndim - target_shift.ndim,
             )
-            augmented_targets.append(torch.where(target_mask, target + target_shift, target))
+            augmented_target = torch.where(target_mask, target + target_shift, target)
+            augmented_targets.append(augmented_target.clamp(-0.995, 0.995))
         return tuple(augmented_targets)
-
-    @staticmethod
-    def _clamp_teacher_relaxation_targets(targets: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """Clamp teacher R1/R2 targets through stable physical T1/T2 ranges."""
-        if len(targets) < 3:
-            return targets
-        t1 = standardized_rate_to_relaxation_time(targets[1], R1_STATS).clamp(MIN_SUPERVISED_T1, MAX_TEACHER_T1)
-        t2 = standardized_rate_to_relaxation_time(targets[2], R2_STATS).clamp(MIN_SUPERVISED_T2, MAX_TEACHER_T2)
-        return (
-            targets[0],
-            relaxation_time_to_standardized_rate(t1, R1_STATS).to(targets[1].dtype),
-            relaxation_time_to_standardized_rate(t2, R2_STATS).to(targets[2].dtype),
-            *targets[3:],
-        )
 
     def augment_teacher_batch(
         self,
@@ -351,11 +330,7 @@ class FineTuneModule(BaseModule):
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
         """Apply teacher-map geometric/value augmentation and independent CSM flips."""
         if not self.hparams.teacher_spatial_augmentation:
-            return (
-                self._clamp_teacher_relaxation_targets(self._apply_teacher_intensity_augmentation(targets, mask)),
-                mask,
-                csm,
-            )
+            return self._apply_teacher_intensity_augmentation(targets, mask), mask, csm
 
         shape = targets[0].shape
         csm_shape = csm.shape
@@ -420,7 +395,6 @@ class FineTuneModule(BaseModule):
         csm_mask = torch.where(csm_flip_mask, torch.flip(map_mask, dims=(-1,)), map_mask)
         augmented_mask = map_mask & csm_mask
         augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_targets), augmented_mask)
-        augmented_targets = self._clamp_teacher_relaxation_targets(augmented_targets)
         return augmented_targets, augmented_mask, flipped_csm
 
     def maybe_mix_teacher_batch(
@@ -469,7 +443,10 @@ class FineTuneModule(BaseModule):
                     torch.view_as_real(target.to(prediction.dtype)[parameter_mask]),
                 )
             else:
-                component_loss = torch.nn.functional.mse_loss(prediction[parameter_mask], target[parameter_mask])
+                component_loss = torch.nn.functional.mse_loss(
+                    prediction[parameter_mask],
+                    target.to(prediction.dtype)[parameter_mask],
+                )
             loss = loss + (0.5 * component_loss if target_index == 0 else component_loss)
         return loss
 
