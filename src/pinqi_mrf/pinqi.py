@@ -296,6 +296,7 @@ class PINQI(torch.nn.Module):
     ) -> tuple[list[torch.Tensor], list[ParameterTuple], torch.Tensor]:
         """Apply the unrolled PINQI reconstruction."""
         csm_current = csm_initial
+        input_scale: torch.Tensor | None = None
         rhs, normal_op = self.get_normal_equations(coil_rhs, csm_current, subspace_gram)
         rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
         images = list(
@@ -393,6 +394,9 @@ class PINQI(torch.nn.Module):
         if phase is not None:
             images = [image * phase[:, None].conj() for image in images]
             csm_output = csm_output * einops.rearrange(phase, 'batch z 1 y x -> batch 1 z y x')
+        if input_scale is not None:
+            m0_scale = mr2.utils.unsqueeze_at(input_scale.reciprocal(), dim=1, n=parameters[-1][0].ndim - 1)
+            parameters = [(parameter[0] * m0_scale, *parameter[1:]) for parameter in parameters]
         return images, parameters, csm_output
 
 
