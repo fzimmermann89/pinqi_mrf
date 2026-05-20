@@ -278,13 +278,14 @@ class BrainwebDataset(torch.utils.data.Dataset):
         t2_bounds: tuple[float, float] = (0.01, 2.5),
         orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
         bias_field_downsample_factor: int | None = None,
-        bias_field_grid_size_range: tuple[int, int] = (1, 8),
-        m0_bias_range: tuple[float, float] = (0.9, 1.1),
+        bias_field_grid_size_range: tuple[int, int] = (2, 16),
+        m0_bias_range: tuple[float, float] = (0.7, 1.3),
+        m0_component_bias_range: tuple[float, float] = (0.9, 1.1),
         t1_bias_range: tuple[float, float] = (0.9, 1.1),
         t2_bias_range: tuple[float, float] = (0.9, 1.1),
         phase_bias_range: tuple[float, float] = (-math.pi / 12, math.pi / 12),
         polynomial_phase_amplitude_range: tuple[float, float] = (math.pi / 2, 2 * math.pi),
-        global_m0_magnitude_range: tuple[float, float] = (0.8, 1.2),
+        global_m0_magnitude_range: tuple[float, float] = (0.7, 1.3),
         random: bool = True,
     ) -> None:
         """Initialize the dataset."""
@@ -325,6 +326,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         self.bias_field_downsample_factor = bias_field_downsample_factor
         self.bias_field_grid_size_range = bias_field_grid_size_range
         self.m0_bias_range = m0_bias_range
+        self.m0_component_bias_range = m0_component_bias_range
         self.t1_bias_range = t1_bias_range
         self.t2_bias_range = t2_bias_range
         self.phase_bias_range = phase_bias_range
@@ -390,6 +392,8 @@ class BrainwebDataset(torch.utils.data.Dataset):
         """Apply smooth multiplicative and phase augmentations to synthetic parameter maps."""
         spatial_shape = tuple(m0.shape[-2:])
         m0_bias = self._smooth_random_field(rng, spatial_shape, self.m0_bias_range).to(m0.dtype)
+        m0_real_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range).to(m0.dtype)
+        m0_imag_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range).to(m0.dtype)
         t1_bias = self._smooth_random_field(rng, spatial_shape, self.t1_bias_range).to(t1.dtype)
         t2_bias = self._smooth_random_field(rng, spatial_shape, self.t2_bias_range).to(t2.dtype)
         phase_bias = self._smooth_random_field(rng, spatial_shape, self.phase_bias_range)
@@ -399,6 +403,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         global_scale = torch.polar(torch.tensor(global_magnitude, dtype=torch.float32), torch.tensor(global_phase))
         phase = phase_bias + polynomial_phase
         m0 = m0.to(torch.complex64) * m0_bias.to(torch.complex64) * torch.exp(1j * phase).to(torch.complex64)
+        m0 = torch.complex(m0.real * m0_real_bias, m0.imag * m0_imag_bias)
         m0 = m0 * global_scale.to(torch.complex64)
         t1 = (t1 * t1_bias).clamp_min(torch.finfo(t1.dtype).eps)
         t2 = (t2 * t2_bias).clamp_min(torch.finfo(t2.dtype).eps)

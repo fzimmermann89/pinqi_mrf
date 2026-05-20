@@ -504,7 +504,7 @@ class BaseModule(pl.LightningModule):
                 outputs.mask,
                 'm0_abs',
                 r'$|M_0|$',
-                cmap.Colormap('lipari').to_mpl(),
+                plt.get_cmap('gray'),
                 plot_phase=False,
             )
             self._log_m0_figure(
