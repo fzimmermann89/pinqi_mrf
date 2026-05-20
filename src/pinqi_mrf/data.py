@@ -51,6 +51,7 @@ class DelicsRadialBatch(TypedDict):
 class DelicsRadialReferenceBatch(DelicsRadialBatch):
     """Type hint for one DELICS validation sample with reference maps."""
 
+    reference_m0: torch.Tensor
     reference_t1: torch.Tensor
     reference_t2: torch.Tensor
 
@@ -176,6 +177,7 @@ class DelicsRadialDataset(
                 'mask': torch.as_tensor(handle['mask'][slice_index], dtype=torch.bool),
             }
             if self.include_references:
+                sample['reference_m0'] = torch.as_tensor(handle['reference_m0'][slice_index], dtype=torch.complex64)
                 sample['reference_t1'] = torch.as_tensor(handle['reference_t1'][slice_index], dtype=torch.float32)
                 sample['reference_t2'] = torch.as_tensor(handle['reference_t2'][slice_index], dtype=torch.float32)
                 return cast(DelicsRadialReferenceBatch, sample)

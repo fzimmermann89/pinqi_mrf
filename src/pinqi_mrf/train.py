@@ -56,6 +56,9 @@ class ParameterValidationResult:
 class ValidationFigureData:
     """Cached validation outputs for epoch-end figure logging."""
 
+    target_m0: torch.Tensor
+    baseline_m0: torch.Tensor
+    prediction_m0: torch.Tensor
     target_t1: torch.Tensor
     baseline_t1: torch.Tensor
     prediction_t1: torch.Tensor
@@ -492,6 +495,28 @@ class BaseModule(pl.LightningModule):
         if not self.trainer.is_global_zero or not self.validation_step_outputs:
             return
         for loader_id, outputs in self.validation_step_outputs.items():
+            self._log_m0_figure(
+                loader_id,
+                outputs.target_m0,
+                outputs.baseline_m0,
+                outputs.prediction_m0,
+                outputs.mask,
+                'm0_abs',
+                r'$|M_0|$',
+                cmap.Colormap('lipari').to_mpl(),
+                plot_phase=False,
+            )
+            self._log_m0_figure(
+                loader_id,
+                outputs.target_m0,
+                outputs.baseline_m0,
+                outputs.prediction_m0,
+                outputs.mask,
+                'm0_phase',
+                r'$\angle M_0$ [rad]',
+                plt.get_cmap('twilight'),
+                plot_phase=True,
+            )
             self._log_relaxation_time_figure(
                 loader_id,
                 outputs.target_t1,
@@ -642,9 +667,15 @@ class BaseModule(pl.LightningModule):
         loader_id: str,
         result: ParameterValidationResult,
         mask: torch.Tensor,
+        target_m0: torch.Tensor,
+        baseline_m0: torch.Tensor,
+        prediction_m0: torch.Tensor,
     ) -> None:
         """Store one validation batch for epoch-end figure logging."""
         self.validation_step_outputs[loader_id] = ValidationFigureData(
+            target_m0=target_m0.detach().cpu(),
+            baseline_m0=baseline_m0.detach().cpu(),
+            prediction_m0=prediction_m0.detach().cpu(),
             target_t1=result.t1.target.detach().cpu(),
             baseline_t1=result.t1.baseline.detach().cpu(),
             prediction_t1=result.t1.prediction.detach().cpu(),
@@ -736,9 +767,9 @@ class BaseModule(pl.LightningModule):
                 f'debug/{prefix}/pred_q_t2_min': pred_q_t2_masked.amin(),
                 f'debug/{prefix}/pred_q_t2_max': pred_q_t2_masked.amax(),
                 f'debug/{prefix}/pred_t2_invalid_fraction': (~torch.isfinite(pred_t2_masked)).float().mean(),
-                f'debug/{prefix}/pred_t2_gt_display_max_fraction': (
-                    pred_t2_masked > T2_DISPLAY_RANGE[1]
-                ).float().mean(),
+                f'debug/{prefix}/pred_t2_gt_display_max_fraction': (pred_t2_masked > T2_DISPLAY_RANGE[1])
+                .float()
+                .mean(),
             },
             on_epoch=True,
             sync_dist=True,
@@ -747,7 +778,9 @@ class BaseModule(pl.LightningModule):
         )
 
         if batch_idx == 0 and self.trainer.is_global_zero:
-            self._store_validation_images(prefix, result, mask)
+            self._store_validation_images(
+                prefix, result, mask, batch['m0'][:, None, None], baseline_parameters[0], prediction_parameters[0]
+            )
 
     def _kspace_validation_step(
         self,
@@ -779,7 +812,14 @@ class BaseModule(pl.LightningModule):
             add_dataloader_idx=False,
         )
         if batch_idx == 0 and self.trainer.is_global_zero:
-            self._store_validation_images(prefix, result, mask)
+            self._store_validation_images(
+                prefix,
+                result,
+                mask,
+                batch['reference_m0'].to(self.device)[:, None, None],
+                baseline_parameters[0],
+                prediction_parameters[0],
+            )
 
     def validation_loader_type(self, dataloader_idx: int) -> ValidationLoaderType:
         """Return the validation loader type for the active datamodule."""
@@ -860,6 +900,37 @@ class BaseModule(pl.LightningModule):
         self.logger.experiment.log({f'{loader_id}/images/{name}': fig})
         plt.close(fig)
 
+    def _log_m0_figure(
+        self,
+        loader_id: str,
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        prediction: torch.Tensor,
+        mask: torch.Tensor,
+        name: str,
+        label: str,
+        colormap: Colormap,
+        *,
+        plot_phase: bool,
+    ) -> None:
+        """Log one M0 magnitude or phase figure to W&B."""
+        samples = len(mask)
+        fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
+        for sample in range(samples):
+            self.m0_result_plot(
+                target[sample],
+                baseline[sample],
+                prediction[sample],
+                mask[sample],
+                axes[:, sample],
+                label,
+                cmap=colormap,
+                plot_phase=plot_phase,
+            )
+        fig.suptitle(f'{label} Epoch {self.current_epoch}')
+        self.logger.experiment.log({f'{loader_id}/images/{name}': fig})
+        plt.close(fig)
+
     @staticmethod
     def result_plot(
         target: torch.Tensor,
@@ -904,6 +975,65 @@ class BaseModule(pl.LightningModule):
         axes[3].set_title('PINQI Error')
         axes[3].axis('off')
         plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$ [s]')
+
+    @staticmethod
+    def m0_result_plot(
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        pred: torch.Tensor,
+        mask: torch.Tensor,
+        axes: Sequence[plt.Axes] | np.ndarray,
+        label: str,
+        *,
+        cmap: str | Colormap = 'viridis',
+        plot_phase: bool,
+    ) -> None:
+        """Plot M0 magnitude or phase target, prediction, and error."""
+        target = target.squeeze().detach().cpu()
+        baseline = baseline.squeeze().detach().cpu()
+        pred = pred.squeeze().detach().cpu()
+        mask = mask.squeeze().detach().bool().cpu()
+
+        if plot_phase:
+            target_plot = torch.angle(target)
+            baseline_plot = torch.angle(baseline)
+            pred_plot = torch.angle(pred)
+            difference = torch.angle(torch.exp(1j * (target_plot - pred_plot)))
+            vmin, vmax = -np.pi, np.pi
+            diff_vmin, diff_vmax = -np.pi, np.pi
+        else:
+            target_plot = target.abs()
+            baseline_plot = baseline.abs()
+            pred_plot = pred.abs()
+            difference = target_plot - pred_plot
+            vmax = float(np.nanpercentile(target_plot[mask].numpy(), 99)) if mask.any() else 1.0
+            vmin = 0.0
+            diff_vmin, diff_vmax = -0.1 * vmax, 0.1 * vmax
+
+        target_plot[~mask] = torch.nan
+        baseline_plot[~mask] = torch.nan
+        pred_plot[~mask] = torch.nan
+        difference[~mask] = torch.nan
+
+        im0 = axes[0].imshow(target_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        axes[0].set_title('Ground Truth')
+        axes[0].axis('off')
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label=label)
+
+        im1 = axes[1].imshow(baseline_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        axes[1].set_title('Baseline')
+        axes[1].axis('off')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label=label)
+
+        im2 = axes[2].imshow(pred_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        axes[2].set_title('PINQI')
+        axes[2].axis('off')
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label=label)
+
+        im3 = axes[3].imshow(difference, cmap='coolwarm', vmin=diff_vmin, vmax=diff_vmax)
+        axes[3].set_title('PINQI Error')
+        axes[3].axis('off')
+        plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$')
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning-rate scheduler."""

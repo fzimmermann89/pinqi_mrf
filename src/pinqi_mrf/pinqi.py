@@ -255,14 +255,14 @@ class PINQI(torch.nn.Module):
             parameters = self.parameter_net(image_real.contiguous(), cond=cond)
         parameters = parameters.float()
         parameters = einops.rearrange(parameters, 'batch parameters y x -> parameters batch 1 1 y x')
-        m0 = torch.complex(2.0 * torch.tanh(parameters[0]), 2.0 * torch.tanh(parameters[1]))
+        m0 = torch.complex(5.0 * torch.tanh(parameters[0]), 5.0 * torch.tanh(parameters[1]))
         return (m0, *(torch.tanh(parameter) for parameter in parameters[2:].unbind()))
 
     def project_parameters(self, parameters: ParameterTuple) -> ParameterTuple:
         """Project reconstructed parameters into the configured model support."""
         if len(parameters) != len(self.parameter_ranges) + 1:
             raise RuntimeError('Parameter tuple length must match the configured parameter ranges.')
-        m0 = torch.complex(parameters[0].real.clamp(-2.0, 2.0), parameters[0].imag.clamp(-2.0, 2.0))
+        m0 = torch.complex(parameters[0].real.clamp(-5.0, 5.0), parameters[0].imag.clamp(-5.0, 5.0))
         quantitative = tuple(
             parameter.clamp(minimum, maximum)
             for parameter, (minimum, maximum, _n_steps) in zip(parameters[1:], self.parameter_ranges, strict=True)
