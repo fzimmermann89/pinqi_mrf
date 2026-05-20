@@ -205,7 +205,7 @@ class FineTuneModule(BaseModule):
                 kspace = cast(torch.Tensor, sample['kspace'])[None].to(self.device)
                 coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft)
                 csm_initial = self.estimate_initial_csm(coil_rhs)
-                _images, parameters = self.pinqi(
+                _images, parameters, csm_final = self.pinqi(
                     coil_rhs,
                     csm_initial,
                     teacher_subspace_gram,
@@ -217,7 +217,7 @@ class FineTuneModule(BaseModule):
                         TeacherSlice(
                             targets=tuple(parameter[0].detach().cpu() for parameter in parameters[-1]),
                             mask=cast(torch.Tensor, sample['mask']).cpu().bool(),
-                            csm=csm_initial[0].detach().cpu(),
+                            csm=csm_final[0].detach().cpu(),
                         ),
                     )
                 )
@@ -458,14 +458,14 @@ class FineTuneModule(BaseModule):
             raise RuntimeError('SSDU split has not been initialized.')
         coil_rhs = self.build_visible_coil_rhs(batch['kspace'])
         csm_initial = self.estimate_initial_csm(coil_rhs)
-        _images, parameters = self.pinqi(
+        _images, parameters, csm_final = self.pinqi(
             coil_rhs,
             csm_initial,
             self.current_subspace_gram_in,
             weight_scale=self.current_subspace_gram_in_scale,
         )
         kspace_loss = batch['kspace'][:, self.current_omega_loss.to(batch['kspace'].device)]
-        kspace_prediction = self.predict_loss_kspace(parameters, csm_initial)
+        kspace_prediction = self.predict_loss_kspace(parameters, csm_final)
         return parameters[-1], parameters, self.ssdu_loss(kspace_prediction, kspace_loss)
 
     def reconstruct_parameters_from_kspace(self, kspace: torch.Tensor) -> list[ParameterTuple]:
@@ -476,7 +476,7 @@ class FineTuneModule(BaseModule):
             raise RuntimeError('SSDU split has not been initialized.')
         coil_rhs = self.build_visible_coil_rhs(kspace)
         csm_initial = self.estimate_initial_csm(coil_rhs)
-        _images, parameters = self.pinqi(
+        _images, parameters, _csm_final = self.pinqi(
             coil_rhs,
             csm_initial,
             self.current_subspace_gram_in,
@@ -512,7 +512,7 @@ class FineTuneModule(BaseModule):
         """Compute the BrainWeb supervised anchor loss used during fine-tuning."""
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
         csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
-        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
         return self.supervised_parameter_loss(parameters, batch)
 
     def teacher_targets_for_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, torch.Tensor]:
@@ -542,7 +542,11 @@ class FineTuneModule(BaseModule):
             if self.hparams.teacher_augmentations_per_step:
                 components['teacher_generated'] = self.teacher_generated_loss(batch, teacher_targets, teacher_csm)
             else:
-                components['teacher_generated'] = self.teacher_parameter_loss(parameters, teacher_targets, batch['mask'])
+                components['teacher_generated'] = self.teacher_parameter_loss(
+                    parameters,
+                    teacher_targets,
+                    batch['mask'],
+                )
         loss = (
             self.hparams.ssdu_loss_weight * components['ssdu']
             + self.hparams.teacher_generated_loss_weight * components['teacher_generated']

@@ -18,6 +18,7 @@ class PINQIConfig:
     csm_refinement_shape: tuple[int, int]
     csm_refinement_weight: float
     csm_refinement_cg_iterations: int
+    phase_normalization_shape: tuple[int, int]
     initial_cg_iterations: int
     initial_cg_regularization: float
     image_cg_iterations: int
@@ -40,6 +41,8 @@ class PINQI(torch.nn.Module):
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
+        phase_normalize_inputs: bool = True,
+        phase_normalization_shape: tuple[int, int] = (32, 32),
         initial_cg_iterations: int = 5,
         initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
@@ -63,6 +66,7 @@ class PINQI(torch.nn.Module):
             csm_refinement_shape=csm_refinement_shape,
             csm_refinement_weight=csm_refinement_weight,
             csm_refinement_cg_iterations=csm_refinement_cg_iterations,
+            phase_normalization_shape=phase_normalization_shape,
             initial_cg_iterations=initial_cg_iterations,
             initial_cg_regularization=initial_cg_regularization,
             image_cg_iterations=image_cg_iterations,
@@ -92,6 +96,7 @@ class PINQI(torch.nn.Module):
         self.softplus = torch.nn.Softplus(beta=5)
         self.weight_scaling = weight_scaling
         self.normalize_inputs = normalize_inputs
+        self.phase_normalize_inputs = phase_normalize_inputs
         self.use_image_net = use_image_net
         self.use_parameter_net = use_parameter_net
         self.use_dictionary_match = use_dictionary_match
@@ -219,6 +224,26 @@ class PINQI(torch.nn.Module):
         scale = torch.quantile(flattened_norm, 0.95, dim=1)
         return scale.clamp_min(1e-8)
 
+    def estimate_phase_correction(self, signal: torch.Tensor) -> torch.Tensor:
+        """Estimate a smooth unit phase that rotates the dominant coefficient image to real-positive."""
+        low_shape = tuple(
+            min(size, target)
+            for size, target in zip(signal.shape[-2:], self.config.phase_normalization_shape, strict=True)
+        )
+
+        def dominant_phase_source(lowres_signal: torch.Tensor) -> torch.Tensor:
+            covariance = lowres_signal.flatten(start_dim=2) @ lowres_signal.flatten(start_dim=2).mH
+            _, eigenvectors = torch.linalg.eigh(covariance)
+            return einops.einsum(
+                eigenvectors[..., -1].conj(),
+                lowres_signal,
+                'batch coeff, batch coeff z t y x -> batch z t y x',
+            )
+
+        phase = mr2.utils.apply_lowres(dominant_phase_source, size=low_shape, dim=(-2, -1))(signal)
+        phase = phase / phase.abs().clamp_min(1e-8)
+        return phase.conj()[:, None]
+
     def get_parameter_reg(self, image: torch.Tensor, iteration: int) -> ParameterTuple:
         """Predict parameter-space prior from the current image estimate."""
         image_real = einops.rearrange(
@@ -268,9 +293,10 @@ class PINQI(torch.nn.Module):
         csm_initial: torch.Tensor,
         subspace_gram: mr2.operators.LinearOperator,
         weight_scale: torch.Tensor | None = None,
-    ) -> tuple[list[torch.Tensor], list[ParameterTuple]]:
+    ) -> tuple[list[torch.Tensor], list[ParameterTuple], torch.Tensor]:
         """Apply the unrolled PINQI reconstruction."""
-        rhs, normal_op = self.get_normal_equations(coil_rhs, csm_initial, subspace_gram)
+        csm_current = csm_initial
+        rhs, normal_op = self.get_normal_equations(coil_rhs, csm_current, subspace_gram)
         rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
         images = list(
             mr2.algorithms.optimizers.cg(
@@ -279,6 +305,13 @@ class PINQI(torch.nn.Module):
                 max_iterations=self.config.initial_cg_iterations,
             )
         )
+        phase = None
+        if self.phase_normalize_inputs:
+            phase = self.estimate_phase_correction(images[-1])[:, 0]
+            csm_current = csm_initial * einops.rearrange(phase, 'batch z 1 y x -> batch 1 z y x').conj()
+            rhs, normal_op = self.get_normal_equations(coil_rhs, csm_current, subspace_gram)
+            rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
+            images = [image * phase[:, None] for image in images]
         if self.normalize_inputs:
             input_scale = self.estimate_input_scale(images[-1]).reciprocal()
             coil_rhs = coil_rhs * mr2.utils.unsqueeze_at(input_scale, dim=1, n=coil_rhs.ndim - 1)
@@ -286,13 +319,14 @@ class PINQI(torch.nn.Module):
             images = [image * mr2.utils.unsqueeze_at(input_scale, dim=1, n=image.ndim - 1) for image in images]
         signal = images[-1]
         parameters: list[ParameterTuple] = []
+        csm_output = csm_current
         linear_solver = self.get_linear_solver(normal_op)
 
         if self.config.csm_refinement_iterations:
             downsampling = mr2.operators.DownSamplingOp(
-                dim=(-2, -1), domain_shape=tuple(csm_initial.shape[-2:]), range_shape=self.config.csm_refinement_shape
+                dim=(-2, -1), domain_shape=tuple(csm_current.shape[-2:]), range_shape=self.config.csm_refinement_shape
             )
-            (csm_low_initial,) = downsampling(csm_initial)
+            (csm_low_initial,) = downsampling(csm_current)
             csm_refinement_solver = self.get_csm_refinement_solver(
                 downsampling=downsampling,
                 subspace_gram=subspace_gram,
@@ -340,20 +374,26 @@ class PINQI(torch.nn.Module):
                 parameter = self.project_parameters(parameter_reg)
                 (signal,) = self.signalmodel(*parameter)
                 signal = signal.swapaxes(0, 1)
+            if phase is not None:
+                parameter = (parameter[0] * phase.conj(), *parameter[1:])
             parameters.append(parameter)
+            csm_output = csm_current
             if iteration in self.config.csm_refinement_iterations:
                 (csm_low,) = csm_refinement_solver(
                     images[-1], coil_rhs, csm_low_initial, initial_value=(csm_low_initial,)
                 )
                 (csm_refined,) = downsampling.H(csm_low)
                 csm_refined = csm_refined / csm_refined.abs().square().sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
-                alignment = (csm_refined * csm_initial.conj()).sum(dim=1, keepdim=True)
-                phase = alignment / alignment.abs().clamp_min(1e-8)
-                csm_refined = csm_refined * phase.conj()
-                rhs, normal_op = self.get_normal_equations(coil_rhs, csm_refined, subspace_gram)
+                alignment = (csm_refined * csm_current.conj()).sum(dim=1, keepdim=True)
+                alignment_phase = alignment / alignment.abs().clamp_min(1e-8)
+                csm_current = csm_refined * alignment_phase.conj()
+                rhs, normal_op = self.get_normal_equations(coil_rhs, csm_current, subspace_gram)
                 rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
                 linear_solver = self.get_linear_solver(normal_op)
-        return images, parameters
+        if phase is not None:
+            images = [image * phase[:, None].conj() for image in images]
+            csm_output = csm_output * einops.rearrange(phase, 'batch z 1 y x -> batch 1 z y x')
+        return images, parameters, csm_output
 
 
 class BaselineReconstruction(torch.nn.Module):
