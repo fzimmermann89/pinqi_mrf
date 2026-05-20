@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
+import gc
 
 import cmap
 import einops
@@ -540,6 +541,8 @@ class BaseModule(pl.LightningModule):
                 cmap.Colormap('navia').to_mpl(),
             )
         self.validation_step_outputs.clear()
+        gc.collect()
+        torch.cuda.memory.empty_cache()
 
     def _evaluate_relaxation_time_validation(
         self,
