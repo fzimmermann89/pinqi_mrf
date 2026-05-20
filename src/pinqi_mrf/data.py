@@ -391,9 +391,9 @@ class BrainwebDataset(torch.utils.data.Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply smooth multiplicative and phase augmentations to synthetic parameter maps."""
         spatial_shape = tuple(m0.shape[-2:])
-        m0_bias = self._smooth_random_field(rng, spatial_shape, self.m0_bias_range).to(m0.dtype)
-        m0_real_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range).to(m0.dtype)
-        m0_imag_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range).to(m0.dtype)
+        m0_bias = self._smooth_random_field(rng, spatial_shape, self.m0_bias_range)
+        m0_real_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
+        m0_imag_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
         t1_bias = self._smooth_random_field(rng, spatial_shape, self.t1_bias_range).to(t1.dtype)
         t2_bias = self._smooth_random_field(rng, spatial_shape, self.t2_bias_range).to(t2.dtype)
         phase_bias = self._smooth_random_field(rng, spatial_shape, self.phase_bias_range)
