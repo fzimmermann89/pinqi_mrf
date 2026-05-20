@@ -87,7 +87,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 1.0,
-        delics_noise_std: float = 2e-3,
+        delics_noise_std: float = 4e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[False] = False,
     ) -> None: ...
@@ -100,7 +100,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 1.0,
-        delics_noise_std: float = 2e-3,
+        delics_noise_std: float = 4e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: Literal[True],
     ) -> None: ...
@@ -112,7 +112,7 @@ class DelicsRadialDataset(
         case_glob: str = 'delics_radial_case*.h5',
         case_ids: Sequence[str] | None = None,
         delics_scale: float = 1.0,
-        delics_noise_std: float = 2e-3,
+        delics_noise_std: float = 4e-3,
         slice_trim: tuple[int, int] = (0, 0),
         include_references: IncludeReferences = False,
     ) -> None:
