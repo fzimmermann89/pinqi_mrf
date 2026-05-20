@@ -275,17 +275,26 @@ class BrainwebDataset(torch.utils.data.Dataset):
         t1_bounds: tuple[float, float] = (0.1, 4.0),
         t2_bounds: tuple[float, float] = (0.01, 2.5),
         orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
-        bias_field_downsample_factor: int = 16,
-        m0_bias_range: tuple[float, float] = (0.8, 1.2),
-        t1_bias_range: tuple[float, float] = (0.8, 1.2),
-        t2_bias_range: tuple[float, float] = (0.8, 1.2),
-        phase_bias_range: tuple[float, float] = (-math.pi / 6, math.pi / 6),
+        bias_field_downsample_factor: int | None = None,
+        bias_field_grid_size_range: tuple[int, int] = (1, 8),
+        m0_bias_range: tuple[float, float] = (0.9, 1.1),
+        t1_bias_range: tuple[float, float] = (0.9, 1.1),
+        t2_bias_range: tuple[float, float] = (0.9, 1.1),
+        phase_bias_range: tuple[float, float] = (-math.pi / 12, math.pi / 12),
+        polynomial_phase_amplitude_range: tuple[float, float] = (0.0, math.pi),
         global_m0_magnitude_range: tuple[float, float] = (0.8, 1.2),
         random: bool = True,
     ) -> None:
         """Initialize the dataset."""
-        if bias_field_downsample_factor <= 0:
+        if bias_field_downsample_factor is not None and bias_field_downsample_factor <= 0:
             raise ValueError('bias_field_downsample_factor must be positive.')
+        if bias_field_grid_size_range[0] <= 0 or bias_field_grid_size_range[0] > bias_field_grid_size_range[1]:
+            raise ValueError('bias_field_grid_size_range must be a positive ascending range.')
+        if (
+            polynomial_phase_amplitude_range[0] < 0
+            or polynomial_phase_amplitude_range[0] > polynomial_phase_amplitude_range[1]
+        ):
+            raise ValueError('polynomial_phase_amplitude_range must be a non-negative ascending range.')
         if random:
             augment = mr2.phantoms.brainweb.augment(size=size)
         else:
@@ -312,10 +321,12 @@ class BrainwebDataset(torch.utils.data.Dataset):
         self.t1_bounds = t1_bounds
         self.t2_bounds = t2_bounds
         self.bias_field_downsample_factor = bias_field_downsample_factor
+        self.bias_field_grid_size_range = bias_field_grid_size_range
         self.m0_bias_range = m0_bias_range
         self.t1_bias_range = t1_bias_range
         self.t2_bias_range = t2_bias_range
         self.phase_bias_range = phase_bias_range
+        self.polynomial_phase_amplitude_range = polynomial_phase_amplitude_range
         self.global_m0_magnitude_range = global_m0_magnitude_range
         self.random = random
 
@@ -329,12 +340,43 @@ class BrainwebDataset(torch.utils.data.Dataset):
         low, high = value_range
         if low > high:
             raise ValueError('value_range lower bound must not exceed the upper bound.')
-        coarse_shape = tuple(max(2, math.ceil(length / self.bias_field_downsample_factor)) for length in shape)
+        if self.bias_field_downsample_factor is None:
+            min_grid_size, max_grid_size = self.bias_field_grid_size_range
+            coarse_shape = (
+                int(rng.int64(min_grid_size, max_grid_size + 1)),
+                int(rng.int64(min_grid_size, max_grid_size + 1)),
+            )
+        else:
+            coarse_shape = tuple(max(2, math.ceil(length / self.bias_field_downsample_factor)) for length in shape)
         coarse_field = rng.float32_tensor((1, 1, *coarse_shape), low=low, high=high)
         field = torch.nn.functional.interpolate(coarse_field, size=shape, mode='bicubic', align_corners=True).squeeze(
             0, 1
         )
         return field.clamp(min=low, max=high)
+
+    def _polynomial_phase_field(
+        self,
+        rng: mr2.utils.RandomGenerator,
+        shape: tuple[int, int],
+    ) -> torch.Tensor:
+        """Create a very smooth random phase field with full-range phase variation."""
+        amplitude = rng.float32(*self.polynomial_phase_amplitude_range)
+        if amplitude == 0:
+            return torch.zeros(shape, dtype=torch.float32)
+        y = torch.linspace(-1.0, 1.0, shape[0], dtype=torch.float32)
+        x = torch.linspace(-1.0, 1.0, shape[1], dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        coefficients = rng.float32_tensor((5,), low=-1.0, high=1.0)
+        field = (
+            coefficients[0] * xx
+            + coefficients[1] * yy
+            + coefficients[2] * xx * yy
+            + coefficients[3] * (xx.square() - xx.square().mean())
+            + coefficients[4] * (yy.square() - yy.square().mean())
+        )
+        field = field - field.mean()
+        field = field / field.abs().amax().clamp_min(torch.finfo(field.dtype).eps)
+        return amplitude * field
 
     def _augment_parameter_maps(
         self,
@@ -349,10 +391,12 @@ class BrainwebDataset(torch.utils.data.Dataset):
         t1_bias = self._smooth_random_field(rng, spatial_shape, self.t1_bias_range).to(t1.dtype)
         t2_bias = self._smooth_random_field(rng, spatial_shape, self.t2_bias_range).to(t2.dtype)
         phase_bias = self._smooth_random_field(rng, spatial_shape, self.phase_bias_range)
+        polynomial_phase = self._polynomial_phase_field(rng, spatial_shape)
         global_magnitude = rng.float32(*self.global_m0_magnitude_range)
         global_phase = rng.float32(-math.pi, math.pi)
         global_scale = torch.polar(torch.tensor(global_magnitude, dtype=torch.float32), torch.tensor(global_phase))
-        m0 = m0.to(torch.complex64) * m0_bias.to(torch.complex64) * torch.exp(1j * phase_bias).to(torch.complex64)
+        phase = phase_bias + polynomial_phase
+        m0 = m0.to(torch.complex64) * m0_bias.to(torch.complex64) * torch.exp(1j * phase).to(torch.complex64)
         m0 = m0 * global_scale.to(torch.complex64)
         t1 = (t1 * t1_bias).clamp_min(torch.finfo(t1.dtype).eps)
         t2 = (t2 * t2_bias).clamp_min(torch.finfo(t2.dtype).eps)
