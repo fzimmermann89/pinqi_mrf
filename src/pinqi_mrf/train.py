@@ -133,6 +133,8 @@ class BaseModule(pl.LightningModule):
         csm_refinement_shape: tuple[int, int] = (64, 64),
         csm_refinement_weight: float = 1e-2,
         csm_refinement_cg_iterations: int = 10,
+        phase_normalize_inputs: bool = True,
+        phase_normalization_shape: tuple[int, int] = (32, 32),
         initial_cg_iterations: int = 5,
         initial_cg_regularization: float = 1e-2,
         image_cg_iterations: int = 20,
@@ -178,6 +180,8 @@ class BaseModule(pl.LightningModule):
             csm_refinement_shape=csm_refinement_shape,
             csm_refinement_weight=csm_refinement_weight,
             csm_refinement_cg_iterations=csm_refinement_cg_iterations,
+            phase_normalize_inputs=phase_normalize_inputs,
+            phase_normalization_shape=phase_normalization_shape,
             initial_cg_iterations=initial_cg_iterations,
             initial_cg_regularization=initial_cg_regularization,
             image_cg_iterations=image_cg_iterations,
@@ -321,7 +325,7 @@ class BaseModule(pl.LightningModule):
         self,
         coil_rhs: torch.Tensor,
         csm_initial: torch.Tensor | None = None,
-    ) -> tuple[list[torch.Tensor], list[ParameterTuple]]:
+    ) -> tuple[list[torch.Tensor], list[ParameterTuple], torch.Tensor]:
         """Apply the PINQI model."""
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
@@ -462,7 +466,7 @@ class BaseModule(pl.LightningModule):
         csm_initial = self.estimate_initial_csm(coil_rhs)
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
         rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
-        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
         baseline_parameters = self.baseline(rhs, normal_op)
         return parameters[-1], baseline_parameters
 
@@ -680,7 +684,7 @@ class BaseModule(pl.LightningModule):
             raise RuntimeError('Acquisition operators have not been initialized.')
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
         rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
-        _images, parameters = self(coil_rhs, csm_initial=csm_initial)
+        _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
         loss, components = self.supervised_parameter_loss(parameters, batch)
         prediction_parameters = parameters[-1]
         baseline_parameters = self.baseline(rhs, normal_op)

@@ -281,7 +281,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         t1_bias_range: tuple[float, float] = (0.9, 1.1),
         t2_bias_range: tuple[float, float] = (0.9, 1.1),
         phase_bias_range: tuple[float, float] = (-math.pi / 12, math.pi / 12),
-        polynomial_phase_amplitude_range: tuple[float, float] = (0.0, math.pi),
+        polynomial_phase_amplitude_range: tuple[float, float] = (math.pi / 2, 2 * math.pi),
         global_m0_magnitude_range: tuple[float, float] = (0.8, 1.2),
         random: bool = True,
     ) -> None:
