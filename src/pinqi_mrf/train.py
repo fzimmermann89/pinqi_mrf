@@ -27,6 +27,7 @@ from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNo
 
 MIN_SUPERVISED_T1 = 0.1
 MIN_SUPERVISED_T2 = 0.01
+M0_LOSS_WEIGHT = 0.5
 T1_DISPLAY_RANGE = (0.0, 2.0)
 T2_DISPLAY_RANGE = (0.020, 0.150)
 
@@ -355,11 +356,7 @@ class BaseModule(pl.LightningModule):
         batch: BatchType,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute supervised synthetic parameter loss in normalized log-time space."""
-        components = {
-            'base': torch.tensor(0.0, device=self.device),
-            'l1': torch.tensor(0.0, device=self.device),
-            'ssim': torch.tensor(0.0, device=self.device),
-        }
+        components = {'base': torch.tensor(0.0), 'l1': torch.tensor(0.0), 'ssim': torch.tensor(0.0)}
         target_parameters = self._parameters_from_batch(batch)
         if len(target_parameters) < 3:
             raise RuntimeError('Synthetic supervision currently expects at least m0, T1, and T2 target parameters.')
@@ -370,34 +367,15 @@ class BaseModule(pl.LightningModule):
         final_iteration = len(predictions) - 1
         for iteration, (prediction, weight) in enumerate(zip(predictions, self.hparams.loss_weights, strict=True)):
             prediction_parameters = tuple(parameter.squeeze(1, 2) for parameter in prediction)
-            parameter_losses = []
-            for target_index, (prediction_parameter, target_parameter) in enumerate(
-                zip(prediction_parameters, target_parameters, strict=True)
-            ):
-                if torch.is_complex(target_parameter):
-                    parameter_loss = torch.nn.functional.mse_loss(
-                        torch.view_as_real(prediction_parameter[parameter_mask]),
-                        torch.view_as_real(target_parameter.to(prediction_parameter.dtype)[parameter_mask]),
-                    )
-                else:
-                    parameter_loss = torch.nn.functional.mse_loss(
-                        prediction_parameter[parameter_mask],
-                        target_parameter[parameter_mask],
-                    )
-                parameter_losses.append(0.5 * parameter_loss if target_index == 0 else parameter_loss)
+            component_losses = self.parameter_component_losses(prediction_parameters, target_parameters, parameter_mask)
+            parameter_loss = M0_LOSS_WEIGHT * component_losses[0]  # downweight M0
+            parameter_loss = sum(component_losses[1:], start=parameter_loss)
             loss_outside = prediction_parameters[0][~mask].abs().mean()
-            components['base'] = components['base'] + weight * (
-                sum(parameter_losses, start=torch.zeros((), device=self.device)) + 0.1 * loss_outside
-            )
+            components['base'] = components['base'] + weight * (parameter_loss + 0.1 * loss_outside)
             if iteration == final_iteration:
                 component_names = ('m0', 't1', 't2')
-                for parameter_index, parameter_loss in enumerate(parameter_losses):
-                    name = (
-                        component_names[parameter_index]
-                        if parameter_index < len(component_names)
-                        else f'param{parameter_index}'
-                    )
-                    components[name] = parameter_loss * 2 if parameter_index == 0 else parameter_loss
+                for name, parameter_loss in zip(component_names, component_losses, strict=True):
+                    components[name] = parameter_loss
                 components['outside'] = loss_outside
         if self.hparams.loss_l1 or self.hparams.loss_ssim:
             target_quantitative_parameters = tuple(target[:, None, None] for target in target_parameters[1:])
@@ -409,9 +387,7 @@ class BaseModule(pl.LightningModule):
                         target.squeeze(1, 2)[parameter_mask],
                     )
                     for prediction, target in zip(
-                        prediction_quantitative_parameters,
-                        target_quantitative_parameters,
-                        strict=True,
+                        prediction_quantitative_parameters, target_quantitative_parameters, strict=True
                     )
                 )
                 components['l1'] = sum(losses_l1, start=torch.tensor(0.0, device=self.device))
@@ -426,6 +402,27 @@ class BaseModule(pl.LightningModule):
             components['base'] + self.hparams.loss_l1 * components['l1'] + self.hparams.loss_ssim * components['ssim']
         )
         return loss, components
+
+    @staticmethod
+    def parameter_component_losses(
+        predictions: ParameterTuple, targets: ParameterTuple, mask: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Compute masked per-parameter losses.
+
+        The first parameter is complex M0. Its phase is gauge dependent, so compare magnitudes only.
+        """
+        losses: list[torch.Tensor] = []
+        for parameter_index, (prediction, target) in enumerate(zip(predictions, targets, strict=True)):
+            target_is_complex = torch.is_complex(target)
+            if parameter_index == 0 and target_is_complex:
+                losses.append(torch.nn.functional.mse_loss(prediction[mask].abs(), target[mask].abs()))
+            elif target_is_complex:
+                losses.append(
+                    torch.nn.functional.mse_loss(torch.view_as_real(prediction[mask]), torch.view_as_real(target[mask]))
+                )
+            else:
+                losses.append(torch.nn.functional.mse_loss(prediction[mask], target[mask]))
+        return losses
 
     def _parameters_from_batch(self, batch: BatchType) -> ParameterTuple:
         """Extract the ordered parameter tuple from a synthetic batch."""
@@ -502,21 +499,6 @@ class BaseModule(pl.LightningModule):
                 outputs.baseline_m0,
                 outputs.prediction_m0,
                 outputs.mask,
-                'm0_abs',
-                r'$|M_0|$',
-                plt.get_cmap('gray'),
-                plot_phase=False,
-            )
-            self._log_m0_figure(
-                loader_id,
-                outputs.target_m0,
-                outputs.baseline_m0,
-                outputs.prediction_m0,
-                outputs.mask,
-                'm0_phase',
-                r'$\angle M_0$ [rad]',
-                plt.get_cmap('twilight'),
-                plot_phase=True,
             )
             self._log_relaxation_time_figure(
                 loader_id,
@@ -707,61 +689,6 @@ class BaseModule(pl.LightningModule):
             f'debug/{prefix}/ssim_valid_window_fraction': self._ssim_valid_window_fraction(metric_mask),
         }
 
-    def m0_debug_metrics(
-        self,
-        prefix: str,
-        target: torch.Tensor,
-        baseline: torch.Tensor,
-        prediction: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Return M0 magnitude and complex-component diagnostics."""
-
-        def stats(name: str, values: torch.Tensor) -> dict[str, torch.Tensor]:
-            values = values.squeeze(1, 2)
-            valid = mask & torch.isfinite(values.real) & torch.isfinite(values.imag)
-            empty = torch.tensor(float('nan'), device=values.device)
-            if not valid.any():
-                return {
-                    f'debug/{prefix}/{name}_abs_mean': empty,
-                    f'debug/{prefix}/{name}_abs_med': empty,
-                    f'debug/{prefix}/{name}_abs_p99': empty,
-                    f'debug/{prefix}/{name}_abs_max': empty,
-                    f'debug/{prefix}/{name}_real_rms': empty,
-                    f'debug/{prefix}/{name}_imag_rms': empty,
-                    f'debug/{prefix}/{name}_finite_fraction': valid.float().mean(),
-                }
-            masked = values[valid]
-            magnitude = masked.abs()
-            return {
-                f'debug/{prefix}/{name}_abs_mean': magnitude.mean(),
-                f'debug/{prefix}/{name}_abs_med': torch.quantile(magnitude, 0.5),
-                f'debug/{prefix}/{name}_abs_p99': torch.quantile(magnitude, 0.99),
-                f'debug/{prefix}/{name}_abs_max': magnitude.amax(),
-                f'debug/{prefix}/{name}_real_rms': masked.real.square().mean().sqrt(),
-                f'debug/{prefix}/{name}_imag_rms': masked.imag.square().mean().sqrt(),
-                f'debug/{prefix}/{name}_finite_fraction': valid.float().mean(),
-            }
-
-        metrics = stats('target_m0', target)
-        metrics.update(stats('baseline_m0', baseline))
-        metrics.update(stats('prediction_m0', prediction))
-        input_scale = self.pinqi.last_input_scale
-        if input_scale is not None:
-            input_scale = input_scale.to(self.device)
-            external_scale = input_scale.reciprocal()
-            metrics.update(
-                {
-                    f'debug/{prefix}/input_scale_multiplier_mean': input_scale.mean(),
-                    f'debug/{prefix}/input_scale_multiplier_min': input_scale.amin(),
-                    f'debug/{prefix}/input_scale_multiplier_max': input_scale.amax(),
-                    f'debug/{prefix}/input_external_scale_mean': external_scale.mean(),
-                    f'debug/{prefix}/input_external_scale_min': external_scale.amin(),
-                    f'debug/{prefix}/input_external_scale_max': external_scale.amax(),
-                }
-            )
-        return metrics
-
     def _synthetic_validation_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int) -> None:
         """Run one synthetic validation step."""
         prefix = f'val_{dataloader_idx}'
@@ -817,13 +744,6 @@ class BaseModule(pl.LightningModule):
                 f'{prefix}/loss': loss,
                 **{f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
                 **self.mask_debug_metrics(prefix, mask, metric_mask),
-                **self.m0_debug_metrics(
-                    prefix,
-                    batch['m0'][:, None, None],
-                    baseline_parameters[0],
-                    prediction_parameters[0],
-                    metric_mask,
-                ),
                 f'debug/{prefix}/pred_t2_abs_max': pred_t2_masked.abs().amax(),
                 f'debug/{prefix}/pred_t2_min': pred_t2_masked.amin(),
                 f'debug/{prefix}/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
@@ -870,13 +790,6 @@ class BaseModule(pl.LightningModule):
             {
                 **self.parameter_validation_metrics(prefix, result),
                 **self.mask_debug_metrics(prefix, mask, result.metric_mask),
-                **self.m0_debug_metrics(
-                    prefix,
-                    batch['reference_m0'].to(self.device)[:, None, None],
-                    baseline_parameters[0],
-                    prediction_parameters[0],
-                    result.metric_mask,
-                ),
             },
             on_epoch=True,
             sync_dist=True,
@@ -979,13 +892,8 @@ class BaseModule(pl.LightningModule):
         baseline: torch.Tensor,
         prediction: torch.Tensor,
         mask: torch.Tensor,
-        name: str,
-        label: str,
-        colormap: Colormap,
-        *,
-        plot_phase: bool,
     ) -> None:
-        """Log one M0 magnitude or phase figure to W&B."""
+        """Log one M0 magnitude figure to W&B."""
         samples = len(mask)
         fig, axes = plt.subplots(4, samples, figsize=(4 * samples, 16), squeeze=False)
         for sample in range(samples):
@@ -995,12 +903,9 @@ class BaseModule(pl.LightningModule):
                 prediction[sample],
                 mask[sample],
                 axes[:, sample],
-                label,
-                cmap=colormap,
-                plot_phase=plot_phase,
             )
-        fig.suptitle(f'{label} Epoch {self.current_epoch}')
-        self.logger.experiment.log({f'{loader_id}/images/{name}': fig})
+        fig.suptitle(f'$|M_0|$ Epoch {self.current_epoch}')
+        self.logger.experiment.log({f'{loader_id}/images/m0_abs': fig})
         plt.close(fig)
 
     @staticmethod
@@ -1055,52 +960,36 @@ class BaseModule(pl.LightningModule):
         pred: torch.Tensor,
         mask: torch.Tensor,
         axes: Sequence[plt.Axes] | np.ndarray,
-        label: str,
-        *,
-        cmap: str | Colormap = 'viridis',
-        plot_phase: bool,
     ) -> None:
-        """Plot M0 magnitude or phase target, prediction, and error."""
-        target = target.squeeze().detach().cpu()
-        baseline = baseline.squeeze().detach().cpu()
-        pred = pred.squeeze().detach().cpu()
+        """Plot M0 magnitude target, prediction, and error."""
+        target_plot = target.squeeze().detach().cpu().abs()
+        baseline_plot = baseline.squeeze().detach().cpu().abs()
+        pred_plot = pred.squeeze().detach().cpu().abs()
         mask = mask.squeeze().detach().bool().cpu()
-
-        if plot_phase:
-            target_plot = torch.angle(target)
-            baseline_plot = torch.angle(baseline)
-            pred_plot = torch.angle(pred)
-            difference = torch.angle(torch.exp(1j * (target_plot - pred_plot)))
-            vmin, vmax = -np.pi, np.pi
-            diff_vmin, diff_vmax = -np.pi, np.pi
-        else:
-            target_plot = target.abs()
-            baseline_plot = baseline.abs()
-            pred_plot = pred.abs()
-            difference = target_plot - pred_plot
-            vmax = float(np.nanpercentile(target_plot[mask].numpy(), 99)) if mask.any() else 1.0
-            vmin = 0.0
-            diff_vmin, diff_vmax = -0.1 * vmax, 0.1 * vmax
+        difference = target_plot - pred_plot
+        vmax = float(np.nanpercentile(target_plot[mask].numpy(), 99)) if mask.any() else 1.0
+        vmin = 0.0
+        diff_vmin, diff_vmax = -0.1 * vmax, 0.1 * vmax
 
         target_plot[~mask] = torch.nan
         baseline_plot[~mask] = torch.nan
         pred_plot[~mask] = torch.nan
         difference[~mask] = torch.nan
 
-        im0 = axes[0].imshow(target_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        im0 = axes[0].imshow(target_plot, vmin=vmin, vmax=vmax, cmap='gray')
         axes[0].set_title('Ground Truth')
         axes[0].axis('off')
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label=label)
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label=r'$|M_0|$')
 
-        im1 = axes[1].imshow(baseline_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        im1 = axes[1].imshow(baseline_plot, vmin=vmin, vmax=vmax, cmap='gray')
         axes[1].set_title('Baseline')
         axes[1].axis('off')
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label=label)
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label=r'$|M_0|$')
 
-        im2 = axes[2].imshow(pred_plot, vmin=vmin, vmax=vmax, cmap=cmap)
+        im2 = axes[2].imshow(pred_plot, vmin=vmin, vmax=vmax, cmap='gray')
         axes[2].set_title('PINQI')
         axes[2].axis('off')
-        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label=label)
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, label=r'$|M_0|$')
 
         im3 = axes[3].imshow(difference, cmap='coolwarm', vmin=diff_vmin, vmax=diff_vmax)
         axes[3].set_title('PINQI Error')

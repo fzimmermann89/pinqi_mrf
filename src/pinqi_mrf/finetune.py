@@ -15,7 +15,7 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 from pinqi_mrf.acquisition import AcquisitionData
 from pinqi_mrf.data import BatchType, DelicsRadialBatch, FineTuneBatch
 from pinqi_mrf.pinqi import ParameterTuple
-from pinqi_mrf.train import BaseModule, FineTuneHParams
+from pinqi_mrf.train import M0_LOSS_WEIGHT, BaseModule, FineTuneHParams
 
 TEACHER_GAMMA_RANGE = (0.8, 1.2)
 TEACHER_MAX_GLOBAL_SHIFT = 0.1
@@ -435,20 +435,9 @@ class FineTuneModule(BaseModule):
                 parameter_mask = parameter_mask & torch.isfinite(target)
         if not parameter_mask.any():
             return torch.zeros((), device=self.device)
-        loss = torch.zeros((), device=self.device)
-        for target_index, (prediction, target) in enumerate(zip(prediction_tensors, target_tensors, strict=True)):
-            if torch.is_complex(target):
-                component_loss = torch.nn.functional.mse_loss(
-                    torch.view_as_real(prediction[parameter_mask]),
-                    torch.view_as_real(target.to(prediction.dtype)[parameter_mask]),
-                )
-            else:
-                component_loss = torch.nn.functional.mse_loss(
-                    prediction[parameter_mask],
-                    target.to(prediction.dtype)[parameter_mask],
-                )
-            loss = loss + (0.5 * component_loss if target_index == 0 else component_loss)
-        return loss
+        component_losses = self.parameter_component_losses(prediction_tensors, target_tensors, parameter_mask)
+        loss = M0_LOSS_WEIGHT * component_losses[0]  # downweight M0
+        return loss + sum(component_losses[1:], start=torch.tensor(0.0))
 
     def _reconstruct_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, list[ParameterTuple], torch.Tensor]:
         """Run one SSDU reconstruction and return final predictions with held-out loss."""
@@ -522,8 +511,7 @@ class FineTuneModule(BaseModule):
             key = (int(case_id.item()), int(slice_index.item()))
             if key not in self.teacher_cache:
                 raise RuntimeError(
-                    f'Missing teacher pseudo-reference for case {int(case_id.item())} '
-                    f'slice {int(slice_index.item())}.'
+                    f'Missing teacher pseudo-reference for case {int(case_id.item())} slice {int(slice_index.item())}.'
                 )
             teacher_slices.append(self.teacher_cache[key])
         teacher_targets = tuple(
@@ -571,10 +559,7 @@ class FineTuneModule(BaseModule):
         if self.hparams.synthetic_anchor_loss_weight:
             self.log('train/synthetic_loss', synthetic_loss.detach(), on_step=True, on_epoch=True, sync_dist=True)
             self.log_dict(
-                {
-                    f'debug/train/synthetic_loss_{key}': value.detach()
-                    for key, value in synthetic_components.items()
-                },
+                {f'debug/train/synthetic_loss_{key}': value.detach() for key, value in synthetic_components.items()},
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
