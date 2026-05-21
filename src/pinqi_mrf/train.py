@@ -3,8 +3,7 @@
 import gc
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import cmap
 import einops
@@ -19,10 +18,11 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 from mr2.utils.sliding_window import sliding_window
 
 from pinqi_mrf.acquisition import AcquisitionData, create_radial_trajectory
+from pinqi_mrf.baseline import BaselineReconstruction
 from pinqi_mrf.data import BatchType, DelicsRadialReferenceBatch, ValidationLoaderType
 from pinqi_mrf.losses import ssim_loss
 from pinqi_mrf.parameters import LogRelaxationTransform
-from pinqi_mrf.pinqi import PINQI, BaselineReconstruction, ParameterTuple
+from pinqi_mrf.pinqi import PINQI, ParameterTuple
 from pinqi_mrf.signal_models import SubspaceLookup
 from pinqi_mrf.white_kspace_subspace_rhs_sampler import WhiteKspaceSubspaceRhsNoiseSampler
 
@@ -71,48 +71,10 @@ class ValidationFigureData:
     mask: torch.Tensor
 
 
-class PretrainHParams(Protocol):
-    """Typed view of Lightning hyperparameters used by the training modules."""
-
-    n_coils: int
-    n_compressed_coils: int | None
-    use_ground_truth_csm: bool
-    csm_estimation_iterations: int
-    csm_estimation_smoothing_width: int
-    csm_extrapolate: bool
-    use_density_compensation: bool
-    weight_scaling: bool
-    normalize_inputs: bool
-    n_subspace_coefficients: int
-    use_image_net: bool
-    use_parameter_net: bool
-    use_dictionary_match: bool
-    lr: float
-    weight_decay: float
-    loss_weights: Sequence[float]
-    loss_l1: float
-    loss_ssim: float
-
-
-class FineTuneHParams(PretrainHParams, Protocol):
-    """Typed view of fine-tuning-specific hyperparameters."""
-
-    pretrained_checkpoint: Path | None
-    pretrained_checkpoint_strict: bool
-    teacher_generated_loss_weight: float
-    teacher_augmentations_per_step: int
-    teacher_spatial_augmentation: bool
-    teacher_mix_probability: float
-    teacher_mix_beta: float
-    ssdu_loss_fraction: float
-    ssdu_loss_weight: float
-    synthetic_anchor_loss_weight: float
-
-
 class BaseModule(pl.LightningModule):
     """Shared reconstruction plumbing for PINQI-MRF training regimes."""
 
-    hparams: PretrainHParams
+    hparams: Any
 
     def __init__(
         self,

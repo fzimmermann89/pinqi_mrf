@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import einops
 import mr2
@@ -15,7 +15,8 @@ from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierO
 from pinqi_mrf.acquisition import AcquisitionData
 from pinqi_mrf.data import BatchType, DelicsRadialBatch, FineTuneBatch
 from pinqi_mrf.pinqi import ParameterTuple
-from pinqi_mrf.train import M0_LOSS_WEIGHT, BaseModule, FineTuneHParams
+from pinqi_mrf.pretrain import PretrainHParams
+from pinqi_mrf.train import M0_LOSS_WEIGHT, BaseModule
 
 TEACHER_GAMMA_RANGE = (0.8, 1.2)
 TEACHER_MAX_GLOBAL_SHIFT = 0.1
@@ -28,6 +29,23 @@ class TeacherSlice:
     targets: tuple[torch.Tensor, ...]
     mask: torch.Tensor
     csm: torch.Tensor
+
+
+class FineTuneHParams(PretrainHParams, Protocol):
+    """Typed view of fine-tuning-specific hyperparameters."""
+
+    pretrained_checkpoint: Path | None
+    pretrained_checkpoint_strict: bool
+    teacher_generated_loss_weight: float
+    teacher_augmentations_per_step: int
+    teacher_spatial_augmentation: bool
+    teacher_mix_probability: float
+    teacher_mix_beta: float
+    ssdu_loss_fraction: float
+    ssdu_loss_weight: float
+    ssdu_normal_loss_weight: float
+    ssdu_use_density_compensation: bool
+    synthetic_anchor_loss_weight: float
 
 
 class FineTuneModule(BaseModule):
@@ -46,6 +64,8 @@ class FineTuneModule(BaseModule):
         teacher_mix_beta: float = 0.4,
         ssdu_loss_fraction: float = 0.2,
         ssdu_loss_weight: float = 50.0,
+        ssdu_normal_loss_weight: float = 0.0,
+        ssdu_use_density_compensation: bool = True,
         synthetic_anchor_loss_weight: float = 1.0,
         **kwargs: object,
     ) -> None:
@@ -59,6 +79,10 @@ class FineTuneModule(BaseModule):
             raise ValueError('teacher_mix_probability must be in [0, 1].')
         if teacher_mix_beta <= 0:
             raise ValueError('teacher_mix_beta must be positive.')
+        if ssdu_loss_weight < 0:
+            raise ValueError('ssdu_loss_weight must be non-negative.')
+        if ssdu_normal_loss_weight < 0:
+            raise ValueError('ssdu_normal_loss_weight must be non-negative.')
         self.save_hyperparameters(
             {
                 'pretrained_checkpoint': pretrained_checkpoint,
@@ -70,6 +94,8 @@ class FineTuneModule(BaseModule):
                 'teacher_mix_beta': teacher_mix_beta,
                 'ssdu_loss_fraction': ssdu_loss_fraction,
                 'ssdu_loss_weight': ssdu_loss_weight,
+                'ssdu_normal_loss_weight': ssdu_normal_loss_weight,
+                'ssdu_use_density_compensation': ssdu_use_density_compensation,
                 'synthetic_anchor_loss_weight': synthetic_anchor_loss_weight,
             }
         )
@@ -83,6 +109,8 @@ class FineTuneModule(BaseModule):
         self.current_nufft_loss: mr2.operators.NonUniformFastFourierOp | None = None
         self.current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.current_subspace_gram_in_scale: torch.Tensor | None = None
+        self.current_subspace_gram_loss: SubspaceNonUniformFastFourierOpGramOp | None = None
+        self.current_subspace_gram_loss_scale: torch.Tensor | None = None
         self.teacher_cache: dict[tuple[int, int], TeacherSlice] = {}
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
@@ -161,6 +189,15 @@ class FineTuneModule(BaseModule):
         )
         weight = acquisition_in.dcf.data if self.hparams.use_density_compensation else None
         subspace_gram = nufft_in.toeplitz(weight=weight, subspace=basis_in, subspace_dim=1)
+        weight_loss = acquisition_loss.dcf.data if self.hparams.ssdu_use_density_compensation else None
+        self.current_subspace_gram_loss_scale = None
+        if self.hparams.ssdu_normal_loss_weight:
+            loss_gram = nufft_loss.toeplitz(weight=weight_loss, subspace=basis_loss, subspace_dim=1)
+            self.current_subspace_gram_loss = cast(SubspaceNonUniformFastFourierOpGramOp, loss_gram)
+            if self.hparams.weight_scaling:
+                self.current_subspace_gram_loss_scale = self.estimate_subspace_gram_scale(loss_gram)
+        else:
+            self.current_subspace_gram_loss = None
         self.current_acquisition_in = acquisition_in
         self.current_acquisition_loss = acquisition_loss
         self.current_subspace_basis_in = basis_in
@@ -294,7 +331,7 @@ class FineTuneModule(BaseModule):
             raise RuntimeError('SSDU split has not been initialized.')
         residual = prediction - target
         residual_power = residual.abs().square()
-        if not self.hparams.use_density_compensation:
+        if not self.hparams.ssdu_use_density_compensation:
             return residual_power.mean()
         weight = self.current_acquisition_loss.dcf.data.to(residual_power.device)
         return (weight * residual_power).sum() / weight.sum().clamp_min(torch.finfo(weight.dtype).eps)
@@ -440,7 +477,9 @@ class FineTuneModule(BaseModule):
         loss = M0_LOSS_WEIGHT * component_losses[0]  # downweight M0
         return sum(component_losses[1:], start=loss)
 
-    def _reconstruct_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, list[ParameterTuple], torch.Tensor]:
+    def _reconstruct_batch(
+        self, batch: DelicsRadialBatch
+    ) -> tuple[ParameterTuple, list[ParameterTuple], dict[str, torch.Tensor]]:
         """Run one SSDU reconstruction and return final predictions with held-out loss."""
         if self.current_subspace_gram_in is None:
             self.setup_ssdu_split()
@@ -454,9 +493,49 @@ class FineTuneModule(BaseModule):
             self.current_subspace_gram_in,
             weight_scale=self.current_subspace_gram_in_scale,
         )
-        kspace_loss = batch['kspace'][:, self.current_omega_loss.to(batch['kspace'].device)]
-        kspace_prediction = self.predict_loss_kspace(parameters, csm_final)
-        return parameters[-1], parameters, self.ssdu_loss(kspace_prediction, kspace_loss)
+        use_kspace_loss = self.hparams.ssdu_loss_weight > 0
+        use_normal_loss = self.hparams.ssdu_normal_loss_weight > 0
+        components = {
+            'ssdu_kspace': torch.zeros((), device=self.device),
+            'ssdu_normal': torch.zeros((), device=self.device),
+        }
+        if use_kspace_loss or use_normal_loss:
+            kspace_loss = batch['kspace'][:, self.current_omega_loss.to(batch['kspace'].device)]
+        if use_kspace_loss:
+            kspace_prediction = self.predict_loss_kspace(parameters, csm_final)
+            components['ssdu_kspace'] = self.ssdu_loss(kspace_prediction, kspace_loss)
+        if use_normal_loss:
+            if (
+                self.current_acquisition_loss is None
+                or self.current_subspace_basis_loss is None
+                or self.current_nufft_loss is None
+                or self.current_subspace_gram_loss is None
+            ):
+                raise RuntimeError('Normal-space SSDU split has not been initialized.')
+            acquisition_loss = self.current_acquisition_loss
+            basis_loss = self.current_subspace_basis_loss
+            nufft_loss = self.current_nufft_loss
+            subspace_gram_loss = self.current_subspace_gram_loss
+            (coefficients,) = self.signalmodel(*parameters[-1])
+            coefficients = coefficients.movedim(0, 1)
+            csm_op = mr2.operators.SensitivityOp(csm_final[:, None])
+            (coil_coefficients,) = csm_op(coefficients)
+            (predicted_rhs,) = subspace_gram_loss(coil_coefficients)
+            if self.hparams.ssdu_use_density_compensation:
+                (kspace_loss,) = acquisition_loss.dcf.as_operator()(kspace_loss)
+            (loss_time_images,) = nufft_loss.H(kspace_loss)
+            target_rhs = einops.einsum(
+                basis_loss.conj(),
+                loss_time_images,
+                'time coeff, batch time coil z y x -> batch coeff coil z y x',
+            )
+            if self.current_subspace_gram_loss_scale is not None:
+                predicted_rhs = predicted_rhs / self.current_subspace_gram_loss_scale
+                target_rhs = target_rhs / self.current_subspace_gram_loss_scale
+            residual_power = (predicted_rhs - target_rhs).abs().square()
+            target_power = target_rhs.abs().square().mean().clamp_min(torch.finfo(target_rhs.real.dtype).eps)
+            components['ssdu_normal'] = residual_power.mean() / target_power
+        return parameters[-1], parameters, components
 
     def reconstruct_parameters_from_kspace(self, kspace: torch.Tensor) -> list[ParameterTuple]:
         """Run the student reconstruction from synthetic k-space."""
@@ -524,8 +603,8 @@ class FineTuneModule(BaseModule):
 
     def delics_loss(self, batch: DelicsRadialBatch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DELICS fine-tuning loss components for one batch."""
-        _final_parameters, parameters, ssdu_loss = self._reconstruct_batch(batch)
-        components = {'ssdu': ssdu_loss, 'teacher_generated': torch.zeros((), device=self.device)}
+        _final_parameters, parameters, components = self._reconstruct_batch(batch)
+        components['teacher_generated'] = torch.zeros((), device=self.device)
         if self.hparams.teacher_generated_loss_weight:
             teacher_targets, teacher_csm = self.teacher_targets_for_batch(batch)
             if self.hparams.teacher_augmentations_per_step:
@@ -537,7 +616,8 @@ class FineTuneModule(BaseModule):
                     batch['mask'],
                 )
         loss = (
-            self.hparams.ssdu_loss_weight * components['ssdu']
+            self.hparams.ssdu_loss_weight * components['ssdu_kspace']
+            + self.hparams.ssdu_normal_loss_weight * components['ssdu_normal']
             + self.hparams.teacher_generated_loss_weight * components['teacher_generated']
         )
         return loss, components
@@ -547,22 +627,16 @@ class FineTuneModule(BaseModule):
         delics_loss, components = self.delics_loss(batch['delics'])
         synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
         loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('train/ssdu_loss', components['ssdu'].detach(), on_step=True, on_epoch=True, sync_dist=True)
+        self.log('train/loss', loss, on_epoch=True, prog_bar=True)  # on_step is true automatically in training_step
+        self.log('train/ssdu_kspace_loss', components['ssdu_kspace'], on_epoch=True)
+        if self.hparams.ssdu_normal_loss_weight:
+            self.log('train/ssdu_normal_loss', components['ssdu_normal'], on_epoch=True, sync_dist=True)
         if self.hparams.teacher_generated_loss_weight:
-            self.log(
-                'train/teacher_generated_loss',
-                components['teacher_generated'].detach(),
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-            )
+            self.log('train/teacher_generated_loss', components['teacher_generated'], on_epoch=True)
         if self.hparams.synthetic_anchor_loss_weight:
-            self.log('train/synthetic_loss', synthetic_loss.detach(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log('train/synthetic_loss', synthetic_loss, on_epoch=True)
             self.log_dict(
                 {f'debug/train/synthetic_loss_{key}': value.detach() for key, value in synthetic_components.items()},
-                on_step=False,
                 on_epoch=True,
-                sync_dist=True,
             )
         return loss
