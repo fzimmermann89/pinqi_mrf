@@ -2,10 +2,10 @@
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Generic, Literal, TypedDict, TypeVar, cast, overload
+from typing import Generic, Literal, TypedDict, TypeVar, overload
 
 import h5py
 import lightning.pytorch as pl
@@ -13,7 +13,9 @@ import mr2
 import torch
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
-BRAINWEB_VALUES_3T_RANDOMIZED = {
+BrainwebTissueName = Literal['skl', 'gry', 'wht', 'csf', 'mrw', 'dura', 'fat', 'fat2', 'mus', 'm-s', 'ves']
+
+BRAINWEB_VALUES_3T_RANDOMIZED: Mapping[BrainwebTissueName, mr2.phantoms.brainweb.BrainwebTissue] = {
     'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.05), (-0.2, 0.2)),
     'gry': mr2.phantoms.brainweb.BrainwebTissue((1.200, 2.000), (0.080, 0.120), (0.70, 1.00), (-0.2, 0.2)),
     'wht': mr2.phantoms.brainweb.BrainwebTissue((0.800, 1.500), (0.060, 0.100), (0.50, 0.90), (-0.2, 0.2)),
@@ -114,7 +116,7 @@ class DelicsRadialDataset(
         delics_scale: float = 1.0,
         delics_noise_std: float = 4e-3,
         slice_trim: tuple[int, int] = (0, 0),
-        include_references: IncludeReferences = False,
+        include_references: bool = False,
     ) -> None:
         """Initialize the DELICS radial dataset."""
         self.folder = folder
@@ -170,18 +172,20 @@ class DelicsRadialDataset(
                 noise_imag = rng.randn_tensor(kspace.shape, torch.float32)
                 noise = (self.delics_noise_std / math.sqrt(2.0)) * torch.complex(noise_real, noise_imag)
                 kspace = kspace + noise.to(torch.complex64)
-            sample: DelicsRadialBatch | DelicsRadialReferenceBatch = {
+            sample: DelicsRadialBatch = {
                 'case_id': torch.tensor(file_index, dtype=torch.int64),
                 'slice_index': torch.tensor(slice_index, dtype=torch.int64),
                 'kspace': kspace,
                 'mask': torch.as_tensor(handle['mask'][slice_index], dtype=torch.bool),
             }
             if self.include_references:
-                sample['reference_m0'] = torch.as_tensor(handle['reference_m0'][slice_index], dtype=torch.complex64)
-                sample['reference_t1'] = torch.as_tensor(handle['reference_t1'][slice_index], dtype=torch.float32)
-                sample['reference_t2'] = torch.as_tensor(handle['reference_t2'][slice_index], dtype=torch.float32)
-                return cast(DelicsRadialReferenceBatch, sample)
-            return cast(DelicsRadialBatch, sample)
+                return {
+                    **sample,
+                    'reference_m0': torch.as_tensor(handle['reference_m0'][slice_index], dtype=torch.complex64),
+                    'reference_t1': torch.as_tensor(handle['reference_t1'][slice_index], dtype=torch.float32),
+                    'reference_t2': torch.as_tensor(handle['reference_t2'][slice_index], dtype=torch.float32),
+                }
+            return sample
 
 
 class DelicsRadialDataModule(pl.LightningDataModule):
@@ -351,7 +355,10 @@ class BrainwebDataset(torch.utils.data.Dataset):
                 int(rng.int64(min_grid_size, max_grid_size + 1)),
             )
         else:
-            coarse_shape = tuple(max(2, math.ceil(length / self.bias_field_downsample_factor)) for length in shape)
+            coarse_shape = (
+                max(2, math.ceil(shape[0] / self.bias_field_downsample_factor)),
+                max(2, math.ceil(shape[1] / self.bias_field_downsample_factor)),
+            )
         coarse_field = rng.float32_tensor((1, 1, *coarse_shape), low=low, high=high)
         field = torch.nn.functional.interpolate(coarse_field, size=shape, mode='bicubic', align_corners=True).squeeze(
             0, 1
@@ -390,7 +397,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         rng: mr2.utils.RandomGenerator,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply smooth multiplicative and phase augmentations to synthetic parameter maps."""
-        spatial_shape = tuple(m0.shape[-2:])
+        spatial_shape = (m0.shape[-2], m0.shape[-1])
         m0_bias = self._smooth_random_field(rng, spatial_shape, self.m0_bias_range)
         m0_real_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
         m0_imag_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
