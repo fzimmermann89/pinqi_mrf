@@ -101,6 +101,7 @@ class PINQI(torch.nn.Module):
         self.use_parameter_net = use_parameter_net
         self.use_dictionary_match = use_dictionary_match
         self.parameter_ranges = parameter_ranges
+        self.last_input_scale: torch.Tensor | None = None
         self.iteration_embedding = torch.nn.Embedding(n_iterations, 128)
         self.nonlinear_solver = mr2.operators.DifferentiableDictionaryMatchOp(
             self.signalmodel,
@@ -297,6 +298,7 @@ class PINQI(torch.nn.Module):
         """Apply the unrolled PINQI reconstruction."""
         csm_current = csm_initial
         input_scale: torch.Tensor | None = None
+        self.last_input_scale = None
         rhs, normal_op = self.get_normal_equations(coil_rhs, csm_current, subspace_gram)
         rhs, normal_op = self.scale_linear_system(rhs, normal_op, weight_scale)
         images = list(
@@ -315,6 +317,7 @@ class PINQI(torch.nn.Module):
             images = [image * phase[:, None] for image in images]
         if self.normalize_inputs:
             input_scale = self.estimate_input_scale(images[-1]).reciprocal()
+            self.last_input_scale = input_scale.detach()
             coil_rhs = coil_rhs * mr2.utils.unsqueeze_at(input_scale, dim=1, n=coil_rhs.ndim - 1)
             rhs = rhs * mr2.utils.unsqueeze_at(input_scale, dim=1, n=rhs.ndim - 1)
             images = [image * mr2.utils.unsqueeze_at(input_scale, dim=1, n=image.ndim - 1) for image in images]
