@@ -240,6 +240,8 @@ class BaseModule(pl.LightningModule):
 
     def on_validation_start(self) -> None:
         """Create fixed acquisition operators for standalone validation."""
+        gc.collect()
+        torch.cuda.empty_cache()
         self.setup_acquisition()
 
     def setup_acquisition(self) -> None:
@@ -443,10 +445,23 @@ class BaseModule(pl.LightningModule):
         acquisition: AcquisitionData,
         subspace_basis: torch.Tensor,
         nufft: mr2.operators.NonUniformFastFourierOp,
+        coilwise: bool = False,
     ) -> torch.Tensor:
         """Build coilwise subspace RHS for a selected acquisition."""
         if self.hparams.use_density_compensation:
             (kspace,) = acquisition.dcf.as_operator()(kspace)
+        if coilwise:
+            coil_rhs_chunks = []
+            for coil_kspace in kspace.unbind(dim=2):
+                (coil_time_images,) = nufft.H(coil_kspace[:, :, None])
+                coil_rhs_chunks.append(
+                    einops.einsum(
+                        subspace_basis.conj(),
+                        coil_time_images,
+                        'time coeff, batch time coil z y x -> batch coeff coil z y x',
+                    )
+                )
+            return torch.cat(coil_rhs_chunks, dim=2)
         (coil_time_images,) = nufft.H(kspace)
         return einops.einsum(
             subspace_basis.conj(),
@@ -471,7 +486,7 @@ class BaseModule(pl.LightningModule):
             encoding_matrix=self.matrix_size,
             traj=acquisition.trajectory,
         )
-        coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft)
+        coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft, coilwise=True)
         csm_initial = self.estimate_initial_csm(coil_rhs)
         rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
         rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
@@ -532,7 +547,12 @@ class BaseModule(pl.LightningModule):
             )
         self.validation_step_outputs.clear()
         gc.collect()
-        torch.cuda.memory.empty_cache()
+        torch.cuda.empty_cache()
+
+    def on_train_epoch_end(self) -> None:
+        """Clear CUDA cache at the end of the training epoch."""
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _evaluate_relaxation_time_validation(
         self,
