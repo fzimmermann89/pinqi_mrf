@@ -438,7 +438,7 @@ class FineTuneModule(BaseModule):
             return torch.zeros((), device=self.device)
         component_losses = self.parameter_component_losses(prediction_tensors, target_tensors, parameter_mask)
         loss = M0_LOSS_WEIGHT * component_losses[0]  # downweight M0
-        return loss + sum(component_losses[1:], start=torch.tensor(0.0))
+        return sum(component_losses[1:], start=loss)
 
     def _reconstruct_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, list[ParameterTuple], torch.Tensor]:
         """Run one SSDU reconstruction and return final predictions with held-out loss."""
