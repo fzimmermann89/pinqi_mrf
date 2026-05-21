@@ -57,16 +57,16 @@ class FineTuneModule(BaseModule):
         self,
         pretrained_checkpoint: Path | None = None,
         pretrained_checkpoint_strict: bool = True,
-        teacher_generated_loss_weight: float = 0.1,
+        teacher_generated_loss_weight: float = 0.3,  # Similar gradient scale: 0.4 with synthetic anchor weight 1.
         teacher_augmentations_per_step: int = 2,
         teacher_spatial_augmentation: bool = True,
         teacher_mix_probability: float = 0.25,
         teacher_mix_beta: float = 0.4,
         ssdu_loss_fraction: float = 0.2,
-        ssdu_loss_weight: float = 50.0,
-        ssdu_normal_loss_weight: float = 0.0,
+        ssdu_loss_weight: float = 0.0,  # Similar gradient scale: 0.2 with synthetic anchor weight 1.
+        ssdu_normal_loss_weight: float = 0.2,  # Similar gradient scale: 0.1 with synthetic anchor weight 1.
         ssdu_use_density_compensation: bool = True,
-        synthetic_anchor_loss_weight: float = 1.0,
+        synthetic_anchor_loss_weight: float = 0.5,  # Gradient-scale reference: 1.0.
         **kwargs: object,
     ) -> None:
         """Initialize the fine-tuning module."""
