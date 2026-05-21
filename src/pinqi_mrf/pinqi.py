@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import einops
 import mr2
@@ -28,6 +29,8 @@ class PINQIConfig:
 
 class PINQI(torch.nn.Module):
     """PINQI reconstruction model."""
+
+    prior_weight_scale: torch.Tensor
 
     def __init__(
         self,
@@ -89,8 +92,8 @@ class PINQI(torch.nn.Module):
             n_features=n_features_image_net,
             cond_dim=128,
         )
-        self.parameter_net = torch.compile(self.parameter_net)
-        self.image_net = torch.compile(self.image_net)
+        self.parameter_net = cast(mr2.nn.nets.UNet, torch.compile(self.parameter_net))
+        self.image_net = cast(mr2.nn.nets.UNet, torch.compile(self.image_net))
         lambdas_raw = torch.ones(n_iterations, 2 + self.config.n_parameter_priors)
         self.lambdas_raw = torch.nn.Parameter(lambdas_raw)
         self.softplus = torch.nn.Softplus(beta=5)

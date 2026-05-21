@@ -1,11 +1,13 @@
 """Tests for model-side operator composition helpers."""
 
 from pathlib import Path
+from typing import cast
 
 import mr2
 import pytest
 import torch
 
+from pinqi_mrf.data import BatchType
 from pinqi_mrf.finetune import FineTuneModule
 from pinqi_mrf.pinqi import PINQI, PINQIConfig
 
@@ -41,7 +43,7 @@ def create_small_finetune_module(**kwargs: object) -> FineTuneModule:
         n_features_parameter_net=(32, 64),
         n_features_image_net=(32, 64),
         nonlinear_solver_batch_size=4,
-        **kwargs,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -145,12 +147,15 @@ def test_supervised_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyP
     """Synthetic M0 supervision ignores CSM-gauge phase."""
     monkeypatch.setattr(torch, 'compile', lambda module: module)
     module = create_small_finetune_module(loss_weights=(1.0,))
-    batch = {
-        'm0': torch.ones(1, 2, 2, dtype=torch.complex64),
-        't1': torch.ones(1, 2, 2),
-        't2': torch.ones(1, 2, 2),
-        'mask': torch.tensor([[[True, True], [True, False]]]),
-    }
+    batch = cast(
+        BatchType,
+        {
+            'm0': torch.ones(1, 2, 2, dtype=torch.complex64),
+            't1': torch.ones(1, 2, 2),
+            't2': torch.ones(1, 2, 2),
+            'mask': torch.tensor([[[True, True], [True, False]]]),
+        },
+    )
     target_m0, target_t1, target_t2 = module._parameters_from_batch(batch)
     prediction_m0 = -target_m0[:, None, None].clone()
     prediction_m0[..., 1, 1] = 0

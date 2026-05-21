@@ -38,8 +38,6 @@ class CheckpointDirSaveConfigCallback(SaveConfigCallback):
     def save_config(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
         """Save the config next to checkpoints for reproducible resume commands."""
         _ = pl_module, stage
-        if trainer.default_root_dir is None:
-            return
         config_path = Path(trainer.default_root_dir) / self.config_filename
         config_path.parent.mkdir(parents=True, exist_ok=True)
         self.parser.save(
@@ -73,8 +71,8 @@ class PinqiLightningCLI(LightningCLI):
     ) -> LightningArgumentParser:
         """Prepare regime-specific model and data arguments for custom subcommands."""
         model_class, datamodule_class = self.command_classes[subcommand]
-        original_model_class, self._model_class = self._model_class, model_class
-        original_datamodule_class, self._datamodule_class = self._datamodule_class, datamodule_class
+        original_model_class, self._model_class = self._model_class, model_class  # type:ignore[has-type]
+        original_datamodule_class, self._datamodule_class = self._datamodule_class, datamodule_class  # type:ignore[has-type]
         try:
             parser = super()._prepare_subcommand_parser(klass, subcommand, **kwargs)
         finally:

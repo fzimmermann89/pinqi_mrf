@@ -239,6 +239,7 @@ def create_output_file(
     target.create_dataset('csm_valid', shape=(n_slices,), dtype=np.bool_)
 
     target.attrs['case'] = case
+    target.attrs['schema_version'] = SCHEMA_VERSION
     target.attrs['source_file'] = str(source_file)
     target.attrs['n_slices'] = n_slices
     target.attrs['n_timepoints'] = n_timepoints
@@ -435,11 +436,13 @@ def convert_all(config: ConversionConfig, *, num_workers: int = 1) -> list[Path]
     ]
     outputs = []
     context = mp.get_context('spawn')
-    with context.Pool(processes=num_workers) as pool:
-        with tqdm(total=len(source_files), desc='DELICS files', unit='file', position=0) as progress:
-            for worker_outputs in pool.imap_unordered(convert_files_on_gpu, tasks):
-                outputs.extend(worker_outputs)
-                progress.update(len(worker_outputs))
+    with (
+        context.Pool(processes=num_workers) as pool,
+        tqdm(total=len(source_files), desc='DELICS files', unit='file', position=0) as progress,
+    ):
+        for worker_outputs in pool.imap_unordered(convert_files_on_gpu, tasks):
+            outputs.extend(worker_outputs)
+            progress.update(len(worker_outputs))
     return outputs
 
 

@@ -33,6 +33,8 @@ class TeacherSlice:
 class FineTuneModule(BaseModule):
     """Lightning module for radial k-space fine-tuning."""
 
+    hparams: FineTuneHParams
+
     def __init__(
         self,
         pretrained_checkpoint: Path | None = None,
@@ -48,7 +50,7 @@ class FineTuneModule(BaseModule):
         **kwargs: object,
     ) -> None:
         """Initialize the fine-tuning module."""
-        super().__init__(**kwargs)
+        super().__init__(**kwargs)  # type: ignore[arg-type]
         if not 0 < ssdu_loss_fraction < 1:
             raise ValueError('ssdu_loss_fraction must be in (0, 1).')
         if teacher_augmentations_per_step < 0:
@@ -71,7 +73,6 @@ class FineTuneModule(BaseModule):
                 'synthetic_anchor_loss_weight': synthetic_anchor_loss_weight,
             }
         )
-        self.hparams: FineTuneHParams
         self.current_omega_in: torch.Tensor | None = None
         self.current_omega_loss: torch.Tensor | None = None
         self.current_acquisition_in: AcquisitionData | None = None
@@ -173,7 +174,7 @@ class FineTuneModule(BaseModule):
 
     def refresh_teacher_cache(self) -> None:
         """Predict epoch-level teacher parameter maps for the DELICS training dataset."""
-        datamodule = self.trainer.datamodule
+        datamodule = getattr(self.trainer, 'datamodule', None)
         dataset = getattr(datamodule, 'delics_train_dataset', None)
         if dataset is None:
             raise RuntimeError('Teacher refresh requires a datamodule with a delics_train_dataset.')
@@ -365,16 +366,16 @@ class FineTuneModule(BaseModule):
         )
         augmented = torch.stack([augment(sample) for sample in channels])
 
-        augmented_targets = []
+        augmented_target_list: list[torch.Tensor] = []
         channel_offset = 0
         for target_shape, is_complex, channel_count in target_specs:
             if is_complex:
                 real_part = augmented[:, channel_offset : channel_offset + channel_count]
                 imag_part = augmented[:, channel_offset + channel_count : channel_offset + 2 * channel_count]
-                augmented_targets.append(torch.complex(real_part, imag_part).reshape(target_shape))
+                augmented_target_list.append(torch.complex(real_part, imag_part).reshape(target_shape))
                 channel_offset += 2 * channel_count
             else:
-                augmented_targets.append(
+                augmented_target_list.append(
                     augmented[:, channel_offset : channel_offset + channel_count].reshape(target_shape)
                 )
                 channel_offset += channel_count
@@ -394,7 +395,7 @@ class FineTuneModule(BaseModule):
         flipped_csm = torch.where(csm_flip_csm, torch.flip(augmented_csm, dims=(-1,)), augmented_csm)
         csm_mask = torch.where(csm_flip_mask, torch.flip(map_mask, dims=(-1,)), map_mask)
         augmented_mask = map_mask & csm_mask
-        augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_targets), augmented_mask)
+        augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_target_list), augmented_mask)
         return augmented_targets, augmented_mask, flipped_csm
 
     def maybe_mix_teacher_batch(

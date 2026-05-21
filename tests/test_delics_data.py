@@ -1,6 +1,7 @@
 """Tests for DELICS radial k-space datasets."""
 
 from pathlib import Path
+from typing import Literal
 
 import h5py
 import numpy as np
@@ -15,6 +16,7 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
     n_slices = len(valid)
     kspace = np.ones((n_slices, 3, 4, 1, 1, 5), dtype=np.complex64)
     mask = np.ones((n_slices, 6, 7), dtype=bool)
+    reference_m0 = np.full((n_slices, 6, 7), 1.0 + 0.0j, dtype=np.complex64)
     reference_t1 = np.full((n_slices, 6, 7), 1.2, dtype=np.float32)
     reference_t2 = np.full((n_slices, 6, 7), 0.08, dtype=np.float32)
     with h5py.File(path, 'w') as handle:
@@ -22,6 +24,7 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
         handle.create_dataset('kspace', data=kspace)
         handle.create_dataset('mask', data=mask)
         handle.create_dataset('valid', data=valid)
+        handle.create_dataset('reference_m0', data=reference_m0)
         handle.create_dataset('reference_t1', data=reference_t1)
         handle.create_dataset('reference_t2', data=reference_t2)
 
@@ -60,10 +63,13 @@ def test_delics_radial_reference_dataset_returns_reference_fields(tmp_path: Path
     """Validation samples expose reference relaxation maps explicitly."""
     _write_delics_radial(tmp_path / 'delics_radial_case001.h5')
 
-    dataset = DelicsRadialDataset(tmp_path, include_references=True, delics_noise_std=0.0)
+    dataset: DelicsRadialDataset[Literal[True]] = DelicsRadialDataset(
+        tmp_path, include_references=True, delics_noise_std=0.0
+    )
     sample = dataset[0]
 
-    assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask', 'reference_t1', 'reference_t2'}
+    assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask', 'reference_m0', 'reference_t1', 'reference_t2'}
+    assert sample['reference_m0'].shape == (6, 7)
     assert sample['reference_t1'].shape == (6, 7)
     assert sample['reference_t2'].shape == (6, 7)
 

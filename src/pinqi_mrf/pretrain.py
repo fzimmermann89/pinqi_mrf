@@ -3,7 +3,7 @@
 import torch
 
 from pinqi_mrf.data import BatchType
-from pinqi_mrf.train import BaseModule, PretrainHParams
+from pinqi_mrf.train import BaseModule
 
 
 class PretrainModule(BaseModule):
@@ -11,8 +11,7 @@ class PretrainModule(BaseModule):
 
     def __init__(self, **kwargs: object) -> None:
         """Initialize the pretraining module."""
-        super().__init__(**kwargs)
-        self.hparams: PretrainHParams  # type: ignore[assignment]
+        super().__init__(**kwargs)  # type: ignore[arg-type]
 
     def training_step(self, batch: BatchType, _batch_idx: int) -> torch.Tensor:
         """Run one training step."""

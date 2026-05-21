@@ -1,7 +1,7 @@
 """Shared training infrastructure for PINQI-MRF Lightning modules."""
 
 import gc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import mr2
 import numpy as np
 import torch
+from lightning.pytorch.utilities.types import OptimizerLRSchedulerConfig
 from matplotlib.colors import Colormap
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 from mr2.utils.sliding_window import sliding_window
@@ -82,6 +83,7 @@ class PretrainHParams(Protocol):
     use_density_compensation: bool
     weight_scaling: bool
     normalize_inputs: bool
+    n_subspace_coefficients: int
     use_image_net: bool
     use_parameter_net: bool
     use_dictionary_match: bool
@@ -109,6 +111,8 @@ class FineTuneHParams(PretrainHParams, Protocol):
 
 class BaseModule(pl.LightningModule):
     """Shared reconstruction plumbing for PINQI-MRF training regimes."""
+
+    hparams: PretrainHParams
 
     def __init__(
         self,
@@ -808,7 +812,7 @@ class BaseModule(pl.LightningModule):
 
     def validation_loader_type(self, dataloader_idx: int) -> ValidationLoaderType:
         """Return the validation loader type for the active datamodule."""
-        datamodule = self.trainer.datamodule
+        datamodule = getattr(self.trainer, 'datamodule', None)
         if datamodule is None or not hasattr(datamodule, 'validation_loader_types'):
             raise RuntimeError('Validation requires a datamodule with validation_loader_types.')
         loader_types = tuple(datamodule.validation_loader_types)
@@ -823,9 +827,9 @@ class BaseModule(pl.LightningModule):
         """Run one explicit validation step for the configured validation loaders."""
         match self.validation_loader_type(dataloader_idx):
             case ValidationLoaderType.SYNTHETIC:
-                self._synthetic_validation_step(batch, batch_idx, dataloader_idx)
+                self._synthetic_validation_step(cast(BatchType, batch), batch_idx, dataloader_idx)
             case ValidationLoaderType.KSPACE:
-                self._kspace_validation_step(batch, batch_idx, dataloader_idx)
+                self._kspace_validation_step(cast(DelicsRadialReferenceBatch, batch), batch_idx, dataloader_idx)
             case _:
                 raise ValueError(f'Unknown validation loader type at index {dataloader_idx}.')
 
@@ -882,7 +886,8 @@ class BaseModule(pl.LightningModule):
                 cmap=colormap,
             )
         fig.suptitle(f'{label} Epoch {self.current_epoch}')
-        self.logger.experiment.log({f'{loader_id}/images/{name}': fig})
+        logger = cast(Any, self.logger)
+        logger.experiment.log({f'{loader_id}/images/{name}': fig})
         plt.close(fig)
 
     def _log_m0_figure(
@@ -905,7 +910,8 @@ class BaseModule(pl.LightningModule):
                 axes[:, sample],
             )
         fig.suptitle(f'$|M_0|$ Epoch {self.current_epoch}')
-        self.logger.experiment.log({f'{loader_id}/images/m0_abs': fig})
+        logger = cast(Any, self.logger)
+        logger.experiment.log({f'{loader_id}/images/m0_abs': fig})
         plt.close(fig)
 
     @staticmethod
@@ -996,7 +1002,7 @@ class BaseModule(pl.LightningModule):
         axes[3].axis('off')
         plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04, label=r'$\Delta$')
 
-    def configure_optimizers(self) -> dict[str, Any]:
+    def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
         """Configure optimizer and learning-rate scheduler."""
         scalar_names = ('lambdas_raw', 'rezero')
         params, scalar_params = [], []
@@ -1017,7 +1023,7 @@ class BaseModule(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=[self.hparams.lr, 5 * self.hparams.lr],
-            total_steps=self.trainer.estimated_stepping_batches,
+            total_steps=int(self.trainer.estimated_stepping_batches),
             pct_start=0.1,
             div_factor=20,
             final_div_factor=300,
@@ -1031,17 +1037,18 @@ class LogLambdasCallback(pl.Callback):
     def on_train_batch_end(
         self,
         trainer: pl.Trainer,
-        pl_module: BaseModule,
-        _outputs: dict[str, Any],
+        pl_module: pl.LightningModule,
+        _outputs: torch.Tensor | Mapping[str, Any] | None,
         _batch: object,
         _batch_idx: int,
     ) -> None:
         """Log scalar PINQI weights every few steps."""
         if trainer.global_step % 10 != 0:
             return
-        lambdas = pl_module.pinqi.softplus(pl_module.pinqi.lambdas_raw).detach().cpu()
+        base_module = cast(BaseModule, pl_module)
+        lambdas = base_module.pinqi.softplus(base_module.pinqi.lambdas_raw).detach().cpu()
         for iteration, iteration_lambdas in enumerate(lambdas):
-            pl_module.log_dict(
+            base_module.log_dict(
                 {
                     f'parameter/lambda_{lambda_idx}_{iteration}': value
                     for lambda_idx, value in enumerate(iteration_lambdas)
