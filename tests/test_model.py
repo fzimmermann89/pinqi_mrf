@@ -63,6 +63,7 @@ def test_csm_refinement_solver_matches_manual_expression() -> None:
         csm_refinement_shape=(2, 3),
         csm_refinement_weight=0.0,
         csm_refinement_cg_iterations=1,
+        phase_normalization_shape=(2, 3),
         initial_cg_iterations=1,
         initial_cg_regularization=0.0,
         image_cg_iterations=1,
@@ -140,6 +141,48 @@ def test_teacher_parameter_loss_uses_mask(monkeypatch: pytest.MonkeyPatch) -> No
     torch.testing.assert_close(loss, torch.tensor(4.0))
 
 
+def test_supervised_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic M0 supervision ignores CSM-gauge phase."""
+    monkeypatch.setattr(torch, 'compile', lambda module: module)
+    module = create_small_finetune_module(loss_weights=(1.0,))
+    batch = {
+        'm0': torch.ones(1, 2, 2, dtype=torch.complex64),
+        't1': torch.ones(1, 2, 2),
+        't2': torch.ones(1, 2, 2),
+        'mask': torch.tensor([[[True, True], [True, False]]]),
+    }
+    target_m0, target_t1, target_t2 = module._parameters_from_batch(batch)
+    prediction_m0 = -target_m0[:, None, None].clone()
+    prediction_m0[..., 1, 1] = 0
+    prediction = (prediction_m0, target_t1[:, None, None], target_t2[:, None, None])
+
+    loss, components = module.supervised_parameter_loss([prediction], batch)
+
+    torch.testing.assert_close(components['m0'], torch.tensor(0.0))
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+
+
+def test_teacher_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Teacher M0 supervision ignores CSM-gauge phase."""
+    monkeypatch.setattr(torch, 'compile', lambda module: module)
+    module = create_small_finetune_module()
+    prediction = (
+        -torch.ones(1, 1, 1, 2, 2, dtype=torch.complex64),
+        torch.zeros(1, 1, 1, 2, 2),
+        torch.zeros(1, 1, 1, 2, 2),
+    )
+    target = (
+        torch.ones(1, 1, 1, 2, 2, dtype=torch.complex64),
+        torch.zeros(1, 1, 1, 2, 2),
+        torch.zeros(1, 1, 1, 2, 2),
+    )
+    mask = torch.ones(1, 2, 2, dtype=torch.bool)
+
+    loss = module.teacher_parameter_loss([prediction], target, mask)
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+
+
 def test_input_normalization_uses_coefficient_norm_percentile() -> None:
     """Coefficient-space input normalization uses the robust voxelwise coefficient norm."""
     signal = torch.tensor(
@@ -170,7 +213,7 @@ def test_project_parameters_clamps_to_model_support() -> None:
 
     projected = pinqi.project_parameters(parameters)
 
-    torch.testing.assert_close(projected[0].real, torch.tensor([2.0, 0.25]))
-    torch.testing.assert_close(projected[0].imag, torch.tensor([-2.0, 0.5]))
+    torch.testing.assert_close(projected[0].real, torch.tensor([3.0, 0.25]))
+    torch.testing.assert_close(projected[0].imag, torch.tensor([-4.0, 0.5]))
     torch.testing.assert_close(projected[1], torch.tensor([-0.5, 0.25]))
     torch.testing.assert_close(projected[2], torch.tensor([0.5, 0.75]))
