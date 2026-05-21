@@ -1,10 +1,10 @@
 """Shared training infrastructure for PINQI-MRF Lightning modules."""
 
+import gc
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
-import gc
 
 import cmap
 import einops
@@ -707,6 +707,61 @@ class BaseModule(pl.LightningModule):
             f'debug/{prefix}/ssim_valid_window_fraction': self._ssim_valid_window_fraction(metric_mask),
         }
 
+    def m0_debug_metrics(
+        self,
+        prefix: str,
+        target: torch.Tensor,
+        baseline: torch.Tensor,
+        prediction: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return M0 magnitude and complex-component diagnostics."""
+
+        def stats(name: str, values: torch.Tensor) -> dict[str, torch.Tensor]:
+            values = values.squeeze(1, 2)
+            valid = mask & torch.isfinite(values.real) & torch.isfinite(values.imag)
+            empty = torch.tensor(float('nan'), device=values.device)
+            if not valid.any():
+                return {
+                    f'debug/{prefix}/{name}_abs_mean': empty,
+                    f'debug/{prefix}/{name}_abs_med': empty,
+                    f'debug/{prefix}/{name}_abs_p99': empty,
+                    f'debug/{prefix}/{name}_abs_max': empty,
+                    f'debug/{prefix}/{name}_real_rms': empty,
+                    f'debug/{prefix}/{name}_imag_rms': empty,
+                    f'debug/{prefix}/{name}_finite_fraction': valid.float().mean(),
+                }
+            masked = values[valid]
+            magnitude = masked.abs()
+            return {
+                f'debug/{prefix}/{name}_abs_mean': magnitude.mean(),
+                f'debug/{prefix}/{name}_abs_med': torch.quantile(magnitude, 0.5),
+                f'debug/{prefix}/{name}_abs_p99': torch.quantile(magnitude, 0.99),
+                f'debug/{prefix}/{name}_abs_max': magnitude.amax(),
+                f'debug/{prefix}/{name}_real_rms': masked.real.square().mean().sqrt(),
+                f'debug/{prefix}/{name}_imag_rms': masked.imag.square().mean().sqrt(),
+                f'debug/{prefix}/{name}_finite_fraction': valid.float().mean(),
+            }
+
+        metrics = stats('target_m0', target)
+        metrics.update(stats('baseline_m0', baseline))
+        metrics.update(stats('prediction_m0', prediction))
+        input_scale = self.pinqi.last_input_scale
+        if input_scale is not None:
+            input_scale = input_scale.to(self.device)
+            external_scale = input_scale.reciprocal()
+            metrics.update(
+                {
+                    f'debug/{prefix}/input_scale_multiplier_mean': input_scale.mean(),
+                    f'debug/{prefix}/input_scale_multiplier_min': input_scale.amin(),
+                    f'debug/{prefix}/input_scale_multiplier_max': input_scale.amax(),
+                    f'debug/{prefix}/input_external_scale_mean': external_scale.mean(),
+                    f'debug/{prefix}/input_external_scale_min': external_scale.amin(),
+                    f'debug/{prefix}/input_external_scale_max': external_scale.amax(),
+                }
+            )
+        return metrics
+
     def _synthetic_validation_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int) -> None:
         """Run one synthetic validation step."""
         prefix = f'val_{dataloader_idx}'
@@ -762,6 +817,13 @@ class BaseModule(pl.LightningModule):
                 f'{prefix}/loss': loss,
                 **{f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
                 **self.mask_debug_metrics(prefix, mask, metric_mask),
+                **self.m0_debug_metrics(
+                    prefix,
+                    batch['m0'][:, None, None],
+                    baseline_parameters[0],
+                    prediction_parameters[0],
+                    metric_mask,
+                ),
                 f'debug/{prefix}/pred_t2_abs_max': pred_t2_masked.abs().amax(),
                 f'debug/{prefix}/pred_t2_min': pred_t2_masked.amin(),
                 f'debug/{prefix}/pred_t2_p99': torch.quantile(pred_t2_masked, 0.99),
@@ -808,6 +870,13 @@ class BaseModule(pl.LightningModule):
             {
                 **self.parameter_validation_metrics(prefix, result),
                 **self.mask_debug_metrics(prefix, mask, result.metric_mask),
+                **self.m0_debug_metrics(
+                    prefix,
+                    batch['reference_m0'].to(self.device)[:, None, None],
+                    baseline_parameters[0],
+                    prediction_parameters[0],
+                    result.metric_mask,
+                ),
             },
             on_epoch=True,
             sync_dist=True,
