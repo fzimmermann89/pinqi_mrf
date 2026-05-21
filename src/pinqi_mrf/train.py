@@ -360,7 +360,11 @@ class BaseModule(pl.LightningModule):
         batch: BatchType,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute supervised synthetic parameter loss in normalized log-time space."""
-        components = {'base': torch.tensor(0.0), 'l1': torch.tensor(0.0), 'ssim': torch.tensor(0.0)}
+        components = {
+            'base': torch.tensor(0.0, device=self.device),
+            'l1': torch.tensor(0.0, device=self.device),
+            'ssim': torch.tensor(0.0, device=self.device),
+        }
         target_parameters = self._parameters_from_batch(batch)
         if len(target_parameters) < 3:
             raise RuntimeError('Synthetic supervision currently expects at least m0, T1, and T2 target parameters.')
