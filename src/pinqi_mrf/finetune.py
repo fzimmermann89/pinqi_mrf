@@ -564,6 +564,28 @@ class FineTuneModule(BaseModule):
         )
         return parameters
 
+    def reconstruct_parameters_from_teacher_maps(
+        self, targets: ParameterTuple, csm: torch.Tensor
+    ) -> list[ParameterTuple]:
+        """Run the student reconstruction from teacher maps via the visible Toeplitz RHS."""
+        if self.current_subspace_gram_in is None:
+            self.setup_ssdu_split()
+        if self.current_subspace_gram_in is None:
+            raise RuntimeError('SSDU split has not been initialized.')
+        (coefficients,) = self.signalmodel(*targets)
+        coefficients = coefficients.movedim(0, 1)
+        csm_op = mr2.operators.SensitivityOp(csm[:, None])
+        (coil_coefficients,) = csm_op(coefficients)
+        (coil_rhs,) = self.current_subspace_gram_in(coil_coefficients)
+        csm_initial = self.estimate_initial_csm(coil_rhs)
+        _images, parameters, _csm_final = self.pinqi(
+            coil_rhs,
+            csm_initial,
+            self.current_subspace_gram_in,
+            weight_scale=self.current_subspace_gram_in_scale,
+        )
+        return parameters
+
     def teacher_generated_loss(
         self,
         batch: DelicsRadialBatch,
@@ -583,8 +605,7 @@ class FineTuneModule(BaseModule):
                 mixed_mask,
                 mixed_csm,
             )
-            synthetic_kspace = self.synthesize_kspace(augmented_targets, augmented_csm)
-            synthetic_parameters = self.reconstruct_parameters_from_kspace(synthetic_kspace)
+            synthetic_parameters = self.reconstruct_parameters_from_teacher_maps(augmented_targets, augmented_csm)
             loss_sum = loss_sum + self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask)
         return loss_sum / n_augmentations
 
