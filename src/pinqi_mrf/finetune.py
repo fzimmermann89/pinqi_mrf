@@ -165,7 +165,15 @@ class FineTuneModule(BaseModule):
         n_timepoints = self.signalmodel.n_timepoints
         n_loss = max(1, round(self.hparams.ssdu_loss_fraction * n_timepoints))
         n_loss = min(n_loss, n_timepoints - 1)
-        permutation = torch.randperm(n_timepoints)
+        if self._trainer is None:
+            epoch = 0
+            rank = 0
+        else:
+            epoch = int(self.trainer.current_epoch)
+            rank = int(self.trainer.global_rank)
+        seed = (torch.initial_seed() + 1_000_003 * epoch + rank) % (2**63)
+        generator = torch.Generator().manual_seed(seed)
+        permutation = torch.randperm(n_timepoints, generator=generator)
         omega_loss = permutation[:n_loss].sort().values
         omega_in = permutation[n_loss:].sort().values
         return omega_in, omega_loss
