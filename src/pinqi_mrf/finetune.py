@@ -52,6 +52,10 @@ class FineTuneModule(BaseModule):
     """Lightning module for radial k-space fine-tuning."""
 
     hparams: FineTuneHParams
+    current_nufft_in: mr2.operators.NonUniformFastFourierOp | None
+    current_nufft_loss: mr2.operators.NonUniformFastFourierOp | None
+    current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None
+    current_subspace_gram_loss: SubspaceNonUniformFastFourierOpGramOp | None
 
     def __init__(
         self,
@@ -114,6 +118,13 @@ class FineTuneModule(BaseModule):
         self.teacher_cache: dict[tuple[int, int], TeacherSlice] = {}
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
+
+    def set_runtime_state(self, name: str, value: object) -> None:
+        """Set runtime-only state without registering dynamic operators as DDP-synced modules."""
+        self._modules.pop(name, None)
+        self._parameters.pop(name, None)
+        self._buffers.pop(name, None)
+        object.__setattr__(self, name, value)
 
     def load_pretrained_checkpoint(self, checkpoint_path: Path, *, strict: bool) -> None:
         """Initialize fine-tuning weights from a pretraining checkpoint."""
@@ -193,18 +204,18 @@ class FineTuneModule(BaseModule):
         self.current_subspace_gram_loss_scale = None
         if self.hparams.ssdu_normal_loss_weight:
             loss_gram = nufft_loss.toeplitz(weight=weight_loss, subspace=basis_loss, subspace_dim=1)
-            self.current_subspace_gram_loss = cast(SubspaceNonUniformFastFourierOpGramOp, loss_gram)
+            (self.set_runtime_state('current_subspace_gram_loss', loss_gram),)
             if self.hparams.weight_scaling:
                 self.current_subspace_gram_loss_scale = self.estimate_subspace_gram_scale(loss_gram)
         else:
-            self.current_subspace_gram_loss = None
+            self.set_runtime_state('current_subspace_gram_loss', None)
         self.current_acquisition_in = acquisition_in
         self.current_acquisition_loss = acquisition_loss
         self.current_subspace_basis_in = basis_in
         self.current_subspace_basis_loss = basis_loss
-        self.current_nufft_in = nufft_in
-        self.current_nufft_loss = nufft_loss
-        self.current_subspace_gram_in = cast(SubspaceNonUniformFastFourierOpGramOp, subspace_gram)
+        self.set_runtime_state('current_nufft_in', nufft_in)
+        self.set_runtime_state('current_nufft_loss', nufft_loss)
+        self.set_runtime_state('current_subspace_gram_in', subspace_gram)
         self.current_subspace_gram_in_scale = (
             self.estimate_subspace_gram_scale(self.current_subspace_gram_in) if self.hparams.weight_scaling else None
         )
