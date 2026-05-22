@@ -446,7 +446,7 @@ class BaseModule(pl.LightningModule):
             direction=(-2, -1),
             recon_matrix=self.matrix_size,
             encoding_matrix=self.matrix_size,
-            traj=acquisition.trajectory,
+            traj=acquisition.trajectory.to(self.device),
         )
         coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft, coilwise=True)
         csm_initial = self.estimate_initial_csm(coil_rhs)
