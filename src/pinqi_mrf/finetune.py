@@ -190,13 +190,13 @@ class FineTuneModule(BaseModule):
             direction=(-2, -1),
             recon_matrix=self.matrix_size,
             encoding_matrix=self.matrix_size,
-            traj=acquisition_in.trajectory,
+            traj=acquisition_in.trajectory.to(self.device),
         )
         nufft_loss = mr2.operators.NonUniformFastFourierOp(
             direction=(-2, -1),
             recon_matrix=self.matrix_size,
             encoding_matrix=self.matrix_size,
-            traj=acquisition_loss.trajectory,
+            traj=acquisition_loss.trajectory.to(self.device),
         )
         weight = acquisition_in.dcf.data if self.hparams.use_density_compensation else None
         subspace_gram = nufft_in.toeplitz(weight=weight, subspace=basis_in, subspace_dim=1)
@@ -235,7 +235,7 @@ class FineTuneModule(BaseModule):
             direction=(-2, -1),
             recon_matrix=self.matrix_size,
             encoding_matrix=self.matrix_size,
-            traj=acquisition.trajectory,
+            traj=acquisition.trajectory.to(self.device),
         )
         weight = acquisition.dcf.data if self.hparams.use_density_compensation else None
         teacher_subspace_gram = cast(
