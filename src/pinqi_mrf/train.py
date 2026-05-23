@@ -46,6 +46,8 @@ class RelaxationTimeValidationResult:
     baseline_rmse: torch.Tensor
     ssim: torch.Tensor
     baseline_ssim: torch.Tensor
+    ssim_plotrange: torch.Tensor
+    baseline_ssim_plotrange: torch.Tensor
 
 
 @dataclass
@@ -574,30 +576,39 @@ class BaseModule(pl.LightningModule):
         target_map = target.squeeze(1, 2)
         baseline_map = baseline.squeeze(1, 2)
         prediction_map = prediction.squeeze(1, 2)
+        target_min = target_map.masked_fill(~metric_mask, torch.inf).flatten(start_dim=1).amin(dim=1)[:, None, None]
+        target_max = target_map.masked_fill(~metric_mask, -torch.inf).flatten(start_dim=1).amax(dim=1)[:, None, None]
+        metric_baseline_map = baseline_map
+        metric_prediction_map = prediction_map
         if clip_to_target_range:
-            target_min = target_map.masked_fill(~metric_mask, torch.inf).flatten(start_dim=1).amin(dim=1)
-            target_max = target_map.masked_fill(~metric_mask, -torch.inf).flatten(start_dim=1).amax(dim=1)
-            target_min = mr2.utils.unsqueeze_at(target_min, dim=1, n=target_map.ndim - 1)
-            target_max = mr2.utils.unsqueeze_at(target_max, dim=1, n=target_map.ndim - 1)
-            prediction_map = prediction_map.clamp(min=target_min, max=target_max)
-            baseline_map = baseline_map.clamp(min=target_min, max=target_max)
+            metric_prediction_map = prediction_map.clamp(min=target_min, max=target_max)
+            metric_baseline_map = baseline_map.clamp(min=target_min, max=target_max)
         target_masked = target_map[metric_mask]
-        baseline_masked = baseline_map[metric_mask]
-        prediction_masked = prediction_map[metric_mask]
+        baseline_masked = metric_baseline_map[metric_mask]
+        prediction_masked = metric_prediction_map[metric_mask]
         metric_mask_ssim = metric_mask[:, None]
-        target_ssim = target_map.clamp(*display_range)[:, None]
-        baseline_ssim = baseline_map.clamp(*display_range)[:, None]
-        prediction_ssim = prediction_map.clamp(*display_range)[:, None]
-        target_ssim = torch.where(metric_mask_ssim, target_ssim, torch.zeros_like(target_ssim))
-        baseline_ssim = torch.where(metric_mask_ssim, baseline_ssim, torch.zeros_like(baseline_ssim))
-        prediction_ssim = torch.where(metric_mask_ssim, prediction_ssim, torch.zeros_like(prediction_ssim))
-        data_range = torch.tensor(display_range[1] - display_range[0], device=self.device)
-        (ssim,) = mr2.operators.functionals.SSIM(target_ssim, metric_mask_ssim, data_range=data_range)(prediction_ssim)
-        (baseline_ssim_value,) = mr2.operators.functionals.SSIM(
-            target_ssim,
+        target_plot_range = torch.where(metric_mask_ssim, target_map.clamp(*display_range)[:, None], 0.0)
+        baseline_plot_range = torch.where(metric_mask_ssim, metric_baseline_map.clamp(*display_range)[:, None], 0.0)
+        prediction_plot_range = torch.where(metric_mask_ssim, metric_prediction_map.clamp(*display_range)[:, None], 0.0)
+        plot_data_range = torch.tensor(display_range[1] - display_range[0], dtype=target_map.dtype, device=self.device)
+        (ssim_plotrange,) = mr2.operators.functionals.SSIM(
+            target_plot_range, metric_mask_ssim, data_range=plot_data_range
+        )(prediction_plot_range)
+        (baseline_ssim_plotrange,) = mr2.operators.functionals.SSIM(
+            target_plot_range, metric_mask_ssim, data_range=plot_data_range
+        )(baseline_plot_range)
+        target_target_range = torch.where(metric_mask_ssim, target_map[:, None], 0.0)
+        baseline_target_range = torch.where(metric_mask_ssim, metric_baseline_map[:, None], 0.0)
+        prediction_target_range = torch.where(metric_mask_ssim, metric_prediction_map[:, None], 0.0)
+        target_data_range = (target_max - target_min).clamp_min(torch.finfo(target_map.dtype).eps)[:, None]
+        (ssim,) = mr2.operators.functionals.SSIM(
+            target_target_range, metric_mask_ssim, data_range=target_data_range
+        )(prediction_target_range)
+        (baseline_ssim,) = mr2.operators.functionals.SSIM(
+            target_target_range,
             metric_mask_ssim,
-            data_range=data_range,
-        )(baseline_ssim)
+            data_range=target_data_range,
+        )(baseline_target_range)
         return RelaxationTimeValidationResult(
             target=target,
             baseline=baseline,
@@ -605,7 +616,9 @@ class BaseModule(pl.LightningModule):
             rmse=torch.sqrt(torch.nn.functional.mse_loss(prediction_masked, target_masked)),
             baseline_rmse=torch.sqrt(torch.nn.functional.mse_loss(baseline_masked, target_masked)),
             ssim=ssim,
-            baseline_ssim=baseline_ssim_value,
+            baseline_ssim=baseline_ssim,
+            ssim_plotrange=ssim_plotrange,
+            baseline_ssim_plotrange=baseline_ssim_plotrange,
         )
 
     def evaluate_parameter_validation(
@@ -664,22 +677,22 @@ class BaseModule(pl.LightningModule):
         self,
         prefix: str,
         result: ParameterValidationResult,
-        *,
-        include_ssim: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Return common parameter-validation metrics for one validation loader."""
-        metrics = {
+        return {
             f'{prefix}/rmse_t1': result.t1.rmse,
-            f'{prefix}/ssim_t1_baseline': result.t1.baseline_ssim,
             f'{prefix}/rmse_t1_baseline': result.t1.baseline_rmse,
+            f'{prefix}/ssim_t1': result.t1.ssim,
+            f'{prefix}/ssim_t1_baseline': result.t1.baseline_ssim,
+            f'{prefix}/ssim_t1_plotrange': result.t1.ssim_plotrange,
+            f'{prefix}/ssim_t1_baseline_plotrange': result.t1.baseline_ssim_plotrange,
             f'{prefix}/rmse_t2': result.t2.rmse,
-            f'{prefix}/ssim_t2_baseline': result.t2.baseline_ssim,
             f'{prefix}/rmse_t2_baseline': result.t2.baseline_rmse,
+            f'{prefix}/ssim_t2': result.t2.ssim,
+            f'{prefix}/ssim_t2_baseline': result.t2.baseline_ssim,
+            f'{prefix}/ssim_t2_plotrange': result.t2.ssim_plotrange,
+            f'{prefix}/ssim_t2_baseline_plotrange': result.t2.baseline_ssim_plotrange,
         }
-        if include_ssim:
-            metrics[f'{prefix}/ssim_t1'] = result.t1.ssim
-            metrics[f'{prefix}/ssim_t2'] = result.t2.ssim
-        return metrics
 
     def _store_validation_images(
         self,
@@ -754,9 +767,10 @@ class BaseModule(pl.LightningModule):
         baseline_t2_masked = result.t2.baseline.squeeze(1, 2)[metric_mask]
         target_t2_masked = result.t2.target.squeeze(1, 2)[metric_mask]
         pred_q_t2_masked = prediction_parameters[2].squeeze(1, 2)[metric_mask]
+        metrics = self.parameter_validation_metrics(prefix, result)
         self.log(
             f'{prefix}/ssim_t1',
-            result.t1.ssim,
+            metrics.pop(f'{prefix}/ssim_t1'),
             on_epoch=True,
             prog_bar=True,
             sync_dist=True,
@@ -765,7 +779,7 @@ class BaseModule(pl.LightningModule):
         )
         self.log(
             f'{prefix}/ssim_t2',
-            result.t2.ssim,
+            metrics.pop(f'{prefix}/ssim_t2'),
             on_epoch=True,
             prog_bar=True,
             sync_dist=True,
@@ -774,7 +788,7 @@ class BaseModule(pl.LightningModule):
         )
         self.log_dict(
             {
-                **self.parameter_validation_metrics(prefix, result, include_ssim=False),
+                **metrics,
                 f'{prefix}/loss': loss,
                 **{f'{prefix}/loss_{key}': value.detach() for key, value in components.items()},
                 **self.mask_debug_metrics(prefix, mask, metric_mask),

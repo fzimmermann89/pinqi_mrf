@@ -249,6 +249,43 @@ def test_teacher_flip_augmentation_flips_components_independently(monkeypatch: p
     torch.testing.assert_close(augmented_mask, mask & torch.flip(mask, dims=(-1,)))
 
 
+def test_validation_reports_primary_target_range_and_additional_plotrange_ssim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Primary SSIM uses slice target limits while the extra variant uses plot limits."""
+    monkeypatch.setattr(torch, 'compile', lambda module: module)
+    module = create_small_finetune_module()
+    target = torch.linspace(0.03, 0.08, 64).reshape(1, 1, 1, 8, 8)
+    baseline = target + 0.02
+    prediction = target + 0.04
+    mask = torch.ones(1, 8, 8, dtype=torch.bool)
+    display_range = (0.02, 0.15)
+
+    result = module._evaluate_relaxation_time_validation(
+        target,
+        baseline,
+        prediction,
+        mask,
+        display_range,
+        clip_to_target_range=True,
+    )
+
+    target_map = target.squeeze(1, 2)[:, None]
+    prediction_map = prediction.squeeze(1, 2)[:, None]
+    plot_data_range = torch.tensor(display_range[1] - display_range[0])
+    target_min = target_map.amin()
+    target_max = target_map.amax()
+    clipped_prediction = prediction_map.clamp(min=target_min, max=target_max)
+    (expected_plot_range,) = mr2.operators.functionals.SSIM(
+        target_map.clamp(*display_range), mask[:, None], data_range=plot_data_range
+    )(clipped_prediction.clamp(*display_range))
+    (expected_target_range,) = mr2.operators.functionals.SSIM(
+        target_map, mask[:, None], data_range=(target_max - target_min).reshape(1, 1, 1, 1)
+    )(clipped_prediction)
+
+    torch.testing.assert_close(result.ssim, expected_target_range)
+    torch.testing.assert_close(result.ssim_plotrange, expected_plot_range)
+    assert not torch.isclose(result.ssim, result.ssim_plotrange)
+
+
 def test_input_normalization_uses_coefficient_norm_percentile() -> None:
     """Coefficient-space input normalization uses the robust voxelwise coefficient norm."""
     signal = torch.tensor(

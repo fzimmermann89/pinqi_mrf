@@ -16,6 +16,7 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
     n_slices = len(valid)
     kspace = np.ones((n_slices, 3, 4, 1, 1, 5), dtype=np.complex64)
     mask = np.ones((n_slices, 6, 7), dtype=bool)
+    csm_initial = np.ones((n_slices, 4, 1, 6, 7), dtype=np.complex64)
     reference_m0 = np.full((n_slices, 6, 7), 1.0 + 0.0j, dtype=np.complex64)
     reference_t1 = np.full((n_slices, 6, 7), 1.2, dtype=np.float32)
     reference_t2 = np.full((n_slices, 6, 7), 0.08, dtype=np.float32)
@@ -23,6 +24,7 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
         handle.attrs['case'] = case_id
         handle.create_dataset('kspace', data=kspace)
         handle.create_dataset('mask', data=mask)
+        handle.create_dataset('csm_initial', data=csm_initial)
         handle.create_dataset('valid', data=valid)
         handle.create_dataset('reference_m0', data=reference_m0)
         handle.create_dataset('reference_t1', data=reference_t1)
@@ -68,7 +70,25 @@ def test_delics_radial_reference_dataset_returns_reference_fields(tmp_path: Path
     )
     sample = dataset[0]
 
-    assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask', 'reference_m0', 'reference_t1', 'reference_t2'}
+    assert set(sample) == {
+        'case_id',
+        'slice_index',
+        'kspace',
+        'mask',
+        'm0',
+        't1',
+        't2',
+        'csm',
+        'noise_std',
+        'reference_m0',
+        'reference_t1',
+        'reference_t2',
+    }
+    assert sample['m0'].shape == (6, 7)
+    assert sample['t1'].shape == (6, 7)
+    assert sample['t2'].shape == (6, 7)
+    assert sample['csm'].shape == (4, 1, 6, 7)
+    assert sample['noise_std'].shape == ()
     assert sample['reference_m0'].shape == (6, 7)
     assert sample['reference_t1'].shape == (6, 7)
     assert sample['reference_t2'].shape == (6, 7)
@@ -107,5 +127,7 @@ def test_delics_radial_datamodule_filters_case_ids(tmp_path: Path) -> None:
     assert train_batch['kspace'].shape == (1, 3, 4, 1, 1, 5)
     assert 'reference_t1' not in train_batch
     assert 'reference_t2' not in train_batch
+    assert val_batch['csm'].shape == (1, 4, 1, 6, 7)
+    assert val_batch['noise_std'].shape == (1,)
     assert val_batch['reference_t1'].shape == (1, 6, 7)
     assert val_batch['reference_t2'].shape == (1, 6, 7)

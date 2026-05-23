@@ -5,7 +5,7 @@ import math
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Generic, Literal, TypedDict, TypeVar, overload
+from typing import Generic, Literal, NotRequired, TypedDict, TypeVar, overload
 
 import h5py
 import lightning.pytorch as pl
@@ -50,7 +50,7 @@ class DelicsRadialBatch(TypedDict):
     mask: torch.Tensor
 
 
-class DelicsRadialReferenceBatch(DelicsRadialBatch):
+class DelicsRadialReferenceBatch(DelicsRadialBatch, BatchType):
     """Type hint for one DELICS validation sample with reference maps."""
 
     reference_m0: torch.Tensor
@@ -63,6 +63,7 @@ class FineTuneBatch(TypedDict):
 
     delics: DelicsRadialBatch
     synthetic: BatchType
+    supervised_delics: NotRequired[DelicsRadialReferenceBatch]
 
 
 class ValidationLoaderType(StrEnum):
@@ -179,11 +180,20 @@ class DelicsRadialDataset(
                 'mask': torch.as_tensor(handle['mask'][slice_index], dtype=torch.bool),
             }
             if self.include_references:
+                csm_initial = torch.as_tensor(handle['csm_initial'][slice_index], dtype=torch.complex64)
+                reference_m0 = torch.as_tensor(handle['reference_m0'][slice_index], dtype=torch.complex64)
+                reference_t1 = torch.as_tensor(handle['reference_t1'][slice_index], dtype=torch.float32)
+                reference_t2 = torch.as_tensor(handle['reference_t2'][slice_index], dtype=torch.float32)
                 return {
                     **sample,
-                    'reference_m0': torch.as_tensor(handle['reference_m0'][slice_index], dtype=torch.complex64),
-                    'reference_t1': torch.as_tensor(handle['reference_t1'][slice_index], dtype=torch.float32),
-                    'reference_t2': torch.as_tensor(handle['reference_t2'][slice_index], dtype=torch.float32),
+                    'm0': reference_m0,
+                    't1': reference_t1,
+                    't2': reference_t2,
+                    'csm': csm_initial,
+                    'noise_std': torch.tensor(0.0, dtype=torch.float32),
+                    'reference_m0': reference_m0,
+                    'reference_t1': reference_t1,
+                    'reference_t2': reference_t2,
                 }
             return sample
 
@@ -685,6 +695,7 @@ class FineTuneDataModule(DataModule):
         case_glob: str = 'delics_radial_case*.h5',
         delics_batch_size: int = 1,
         synthetic_batch_size: int = 2,
+        supervised_delics_batch_size: int = 0,
         num_workers: int = 4,
         brainweb_folder: Path = mr2.phantoms.brainweb.CACHE_DIR_BRAINWEB,
         brainweb_size: int = 256,
@@ -713,8 +724,10 @@ class FineTuneDataModule(DataModule):
         self.train_case_ids = train_case_ids
         self.delics_batch_size = delics_batch_size
         self.synthetic_batch_size = synthetic_batch_size
+        self.supervised_delics_batch_size = supervised_delics_batch_size
         self.train_num_workers = num_workers
         self.delics_train_dataset: DelicsRadialDataset[Literal[False]] | None = None
+        self.supervised_delics_train_dataset: DelicsRadialDataset[Literal[True]] | None = None
         self.synthetic_train_dataset: BrainwebDataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
@@ -726,6 +739,12 @@ class FineTuneDataModule(DataModule):
                 slice_trim=(0, 0),
                 include_references=False,
             )
+        if self.supervised_delics_batch_size > 0 and self.supervised_delics_train_dataset is None:
+            self.supervised_delics_train_dataset = self.build_delics_dataset(
+                case_ids=self.train_case_ids,
+                slice_trim=(0, 0),
+                include_references=True,
+            )
         if self.synthetic_train_dataset is None:
             self.synthetic_train_dataset = self.build_brainweb_dataset(
                 orientation=('axial', 'coronal', 'sagittal'),
@@ -736,6 +755,7 @@ class FineTuneDataModule(DataModule):
         """Return paired DELICS and synthetic training loaders."""
         if self.delics_train_dataset is None or self.synthetic_train_dataset is None:
             raise RuntimeError('FineTuneDataModule.setup() must be called before train_dataloader().')
+        loaders: dict[str, torch.utils.data.DataLoader] = {}
         delics_loader = torch.utils.data.DataLoader(
             self.delics_train_dataset,
             batch_size=self.delics_batch_size,
@@ -747,6 +767,7 @@ class FineTuneDataModule(DataModule):
             worker_init_fn=lambda *_: torch.set_num_threads(1),
             drop_last=False,
         )
+        loaders['delics'] = delics_loader
         synthetic_sampler = torch.utils.data.RandomSampler(
             self.synthetic_train_dataset,
             replacement=True,
@@ -764,10 +785,25 @@ class FineTuneDataModule(DataModule):
             worker_init_fn=lambda *_: torch.set_num_threads(1),
             drop_last=False,
         )
-        return CombinedLoader(
-            {
-                'delics': delics_loader,
-                'synthetic': synthetic_loader,
-            },
-            mode='min_size',
-        )
+        loaders['synthetic'] = synthetic_loader
+        if self.supervised_delics_batch_size > 0:
+            if self.supervised_delics_train_dataset is None:
+                raise RuntimeError('FineTuneDataModule.setup() must create supervised DELICS dataset before training.')
+            supervised_delics_sampler = torch.utils.data.RandomSampler(
+                self.supervised_delics_train_dataset,
+                replacement=True,
+                num_samples=len(delics_loader) * self.supervised_delics_batch_size,
+            )
+            loaders['supervised_delics'] = torch.utils.data.DataLoader(
+                self.supervised_delics_train_dataset,
+                batch_size=self.supervised_delics_batch_size,
+                shuffle=False,
+                sampler=supervised_delics_sampler,
+                num_workers=self.train_num_workers,
+                pin_memory=torch.cuda.is_available(),
+                prefetch_factor=4 if self.train_num_workers > 0 else None,
+                persistent_workers=self.train_num_workers > 0,
+                worker_init_fn=lambda *_: torch.set_num_threads(1),
+                drop_last=False,
+            )
+        return CombinedLoader(loaders, mode='min_size')

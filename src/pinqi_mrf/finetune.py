@@ -33,6 +33,7 @@ class FineTuneHParams(PretrainHParams, Protocol):
     ssdu_normal_loss_weight: float
     ssdu_use_density_compensation: bool
     synthetic_anchor_loss_weight: float
+    supervised_delics_loss_weight: float
 
 
 class FineTuneModule(BaseModule):
@@ -57,6 +58,7 @@ class FineTuneModule(BaseModule):
         ssdu_normal_loss_weight: float = 0.2,  # Similar gradient scale: 0.1 with synthetic anchor weight 1.
         ssdu_use_density_compensation: bool = True,
         synthetic_anchor_loss_weight: float = 0.5,  # Gradient-scale reference: 1.0.
+        supervised_delics_loss_weight: float = 0.0,
         **kwargs: object,
     ) -> None:
         """Initialize the fine-tuning module."""
@@ -71,6 +73,8 @@ class FineTuneModule(BaseModule):
             raise ValueError('ssdu_loss_weight must be non-negative.')
         if ssdu_normal_loss_weight < 0:
             raise ValueError('ssdu_normal_loss_weight must be non-negative.')
+        if supervised_delics_loss_weight < 0:
+            raise ValueError('supervised_delics_loss_weight must be non-negative.')
         self.save_hyperparameters(
             {
                 'pretrained_checkpoint': pretrained_checkpoint,
@@ -83,6 +87,7 @@ class FineTuneModule(BaseModule):
                 'ssdu_normal_loss_weight': ssdu_normal_loss_weight,
                 'ssdu_use_density_compensation': ssdu_use_density_compensation,
                 'synthetic_anchor_loss_weight': synthetic_anchor_loss_weight,
+                'supervised_delics_loss_weight': supervised_delics_loss_weight,
             }
         )
         self.current_omega_in: torch.Tensor | None = None
@@ -488,8 +493,8 @@ class FineTuneModule(BaseModule):
             loss_sum = loss_sum + self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask)
         return loss_sum / n_augmentations
 
-    def synthetic_anchor_loss(self, batch: BatchType) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the BrainWeb supervised anchor loss used during fine-tuning."""
+    def supervised_rhs_loss(self, batch: BatchType) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute supervised map loss from a synthesized full-acquisition RHS."""
         coil_rhs, csm_ground_truth = self.simulate_coil_rhs(batch)
         csm_initial = csm_ground_truth if self.hparams.use_ground_truth_csm else self.estimate_initial_csm(coil_rhs)
         _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
@@ -547,8 +552,16 @@ class FineTuneModule(BaseModule):
     def training_step(self, batch: FineTuneBatch, _batch_idx: int) -> torch.Tensor:
         """Run one fine-tuning step."""
         delics_loss, components = self.delics_loss(batch['delics'])
-        synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
+        synthetic_loss, synthetic_components = self.supervised_rhs_loss(batch['synthetic'])
         loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
+        if self.hparams.supervised_delics_loss_weight:
+            if 'supervised_delics' not in batch:
+                raise RuntimeError('supervised_delics_loss_weight requires supervised_delics_batch_size > 0.')
+            supervised_delics_loss, supervised_delics_components = self.supervised_rhs_loss(batch['supervised_delics'])
+            loss = loss + self.hparams.supervised_delics_loss_weight * supervised_delics_loss
+        else:
+            supervised_delics_loss = torch.zeros((), device=self.device)
+            supervised_delics_components = {}
         self.log('train/loss', loss, on_epoch=True, prog_bar=True)  # on_step is true automatically in training_step
         self.log('train/ssdu_kspace_loss', components['ssdu_kspace'], on_epoch=True, sync_dist=False)
         if self.hparams.ssdu_normal_loss_weight:
@@ -559,6 +572,15 @@ class FineTuneModule(BaseModule):
             self.log('train/synthetic_loss', synthetic_loss, on_epoch=True)
             self.log_dict(
                 {f'debug/train/synthetic_loss_{key}': value.detach() for key, value in synthetic_components.items()},
+                on_epoch=True,
+            )
+        if self.hparams.supervised_delics_loss_weight:
+            self.log('train/supervised_delics_loss', supervised_delics_loss, on_epoch=True)
+            self.log_dict(
+                {
+                    f'debug/train/supervised_delics_loss_{key}': value.detach()
+                    for key, value in supervised_delics_components.items()
+                },
                 on_epoch=True,
             )
         return loss
