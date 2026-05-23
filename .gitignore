@@ -200,3 +200,6 @@ cython_debug/
 *~
 *.swp
 *.swo
+
+# debug
+debug/

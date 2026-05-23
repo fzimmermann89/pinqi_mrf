@@ -36,4 +36,4 @@ export NCCL_SOCKET_IFNAME=en
 ulimit -n 16384
 
 echo "Starting training..."
-"${PYTHON}" -u -m pinqi_mrf.cli fit "$@"
+"${PYTHON}" -u -m pinqi_mrf.cli "$@"

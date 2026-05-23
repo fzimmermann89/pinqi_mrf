@@ -4,7 +4,7 @@ import einops
 import mr2
 import torch
 
-from pinqi_mrf.parameters import R1_STATS, R2_STATS, standardized_rate_to_relaxation_time
+from pinqi_mrf.parameters import LogRelaxationTransform
 
 
 class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch.Tensor]):
@@ -19,8 +19,8 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         self,
         signalmodel: mr2.operators.SignalModel,
         n_subspace_coefficients: int,
-        parameter_stats: tuple[tuple[float, float], ...] = (R1_STATS, R2_STATS),
-        parameter_ranges: tuple[tuple[float, float, int], ...] = ((-2.0, 6.5, 200), (-2.0, 9.5, 160)),
+        parameter_transform: LogRelaxationTransform,
+        parameter_ranges: tuple[tuple[float, float, int], ...],
         n_timepoints: int | None = None,
     ) -> None:
         """Initialize the subspace-compressed lookup model.
@@ -32,23 +32,33 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
             The first argument must be a pure multiplicative scaling parameter.
         n_subspace_coefficients
             Number of temporal subspace coefficients.
-        parameter_stats
-            Mean and standard deviation for each standardized relaxation-rate coordinate.
+        parameter_transform
+            Transform mapping normalized log-time coordinates to physical relaxation times.
         parameter_ranges
-            Standardized LUT support ranges as ``(minimum, maximum, n_steps)`` for each parameter.
+            Normalized log-time LUT support ranges as ``(minimum, maximum, n_steps)`` for each parameter.
         n_timepoints
             Number of leading time points to retain from the signal model. If
             ``None``, all time points are used.
         """
         super().__init__()
-        if len(parameter_ranges) != len(parameter_stats):
-            raise ValueError('parameter_ranges and parameter_stats must have the same length.')
+        if len(parameter_ranges) != len(parameter_transform.bounds):
+            raise ValueError('parameter_ranges and parameter_transform.bounds must have the same length.')
+        for index, (minimum, maximum, n_steps) in enumerate(parameter_ranges):
+            if minimum >= maximum:
+                raise ValueError(
+                    f'parameter_ranges[{index}] must satisfy minimum < maximum, got ({minimum}, {maximum}).'
+                )
+            if n_steps < 2:
+                raise ValueError(f'parameter_ranges[{index}] must use at least two steps, got {n_steps}.')
+            if minimum < -1.0 or maximum > 1.0:
+                raise ValueError(
+                    f'parameter_ranges[{index}] must stay inside normalized log-time support [-1, 1], '
+                    f'got ({minimum}, {maximum}).'
+                )
+        self.parameter_transform = parameter_transform
 
         def simulate_unit_scale(*parameters: torch.Tensor) -> tuple[torch.Tensor]:
-            relaxation_times = tuple(
-                standardized_rate_to_relaxation_time(parameter, stats)
-                for parameter, stats in zip(parameters, parameter_stats, strict=True)
-            )
+            relaxation_times = self.parameter_transform.normalized_to_physical(*parameters)
             scale = torch.tensor(1.0 + 0j, dtype=torch.complex64, device=parameters[0].device)
             return signalmodel(scale, *relaxation_times)
 
@@ -93,7 +103,7 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
         m0
             Complex equilibrium signal / proton density.
         parameters
-            Standardized relaxation-rate coordinates.
+            Normalized log-time coordinates.
 
         Returns
         -------
@@ -103,5 +113,7 @@ class SubspaceLookup(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch
 
     def forward(self, m0: torch.Tensor, *parameters: torch.Tensor) -> tuple[torch.Tensor]:
         """Apply the subspace lookup."""
+        parameters = mr2.utils.unsqueeze_tensors_at(*parameters, dim=1, ndim=5)
         (coefficients,) = self.lookup(*parameters)
+        m0 = mr2.utils.unsqueeze_at(m0, dim=min(1, m0.ndim), n=coefficients.ndim - 1 - m0.ndim)
         return (m0 * coefficients,)

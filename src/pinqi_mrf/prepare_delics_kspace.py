@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -21,9 +22,11 @@ from pinqi_mrf.acquisition import RADIAL_GOLDEN_ANGLE, create_radial_trajectory
 SOURCE_DELICS_SCRIPT = '/home/zimmer08/thesis/delics.py'
 SCHEMA_VERSION = 1
 N_COMPRESSED_COILS = 8
+DELICS_KSPACE_SCALE = 250.0
 DEFAULT_INPUT_ROOT = Path('/scratch/zimmer08/delics')
-DEFAULT_OUTPUT_FOLDER = 'radial_kspace'
-DEFAULT_DICTIONARY_BATCH_SIZE = 8192
+DEFAULT_OUTPUT_FOLDER = 'radial_kspace_new'
+DEFAULT_DICTIONARY_BATCH_SIZE = 1024
+DEFAULT_THREADS_PER_WORKER = 16
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class ConversionConfig:
     n_readout_samples: int | None = None
     overwrite: bool = False
     dictionary_batch_size: int = DEFAULT_DICTIONARY_BATCH_SIZE
+    threads_per_worker: int = DEFAULT_THREADS_PER_WORKER
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,17 @@ class ReferenceDictionary:
 
     matcher: mr2.operators.DictionaryMatchOp
     signal: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor]]
+
+
+def configure_worker_threads(n_threads: int) -> None:
+    """Keep per-process CPU thread usage bounded for parallel conversion."""
+    if n_threads < 1:
+        raise ValueError('threads_per_worker must be at least 1.')
+    os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
+    os.environ['OMP_NUM_THREADS'] = str(n_threads)
+    os.environ['MKL_NUM_THREADS'] = str(n_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(n_threads)
+    torch.set_num_threads(n_threads)
 
 
 def create_mask(
@@ -129,8 +144,8 @@ def create_dictionary_matcher(
         return signal_with_m0(m0, t1, t2)
 
     dictionary_match = mr2.operators.DictionaryMatchOp(signal_without_m0, batch_size=batch_size)
-    t1 = torch.linspace(0.2, 4.0, 100, device=device)[:, None]
-    t2 = torch.linspace(0.01, 0.3, 100, device=device)[None, :]
+    t1 = torch.linspace(0.2, 4.0, 400, device=device)[:, None]
+    t2 = torch.linspace(0.001, 1.0, 600, device=device)[None, :]
     dictionary_match.append(t1, t2)
     return ReferenceDictionary(matcher=dictionary_match, signal=signal_with_m0)
 
@@ -224,6 +239,7 @@ def create_output_file(
     target.create_dataset('csm_valid', shape=(n_slices,), dtype=np.bool_)
 
     target.attrs['case'] = case
+    target.attrs['schema_version'] = SCHEMA_VERSION
     target.attrs['source_file'] = str(source_file)
     target.attrs['n_slices'] = n_slices
     target.attrs['n_timepoints'] = n_timepoints
@@ -234,6 +250,7 @@ def create_output_file(
     target.attrs['n_readout_samples'] = n_readout_samples
     target.attrs['trajectory'] = 'golden_angle_radial_2d'
     target.attrs['radial_golden_angle'] = RADIAL_GOLDEN_ANGLE
+    target.attrs['kspace_scale'] = DELICS_KSPACE_SCALE
     target.attrs['created_by'] = 'pinqi_mrf.prepare_delics_kspace'
     copy_source_attrs(source, target)
 
@@ -291,8 +308,8 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
         if tmp_path.exists():
             tmp_path.unlink()
 
-        trajectory, dcf = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
-        traj = trajectory.to(device)
+        acquisition = create_radial_trajectory(n_spokes=n_timepoints, n_readout_samples=n_readout_samples)
+        traj = acquisition.trajectory.to(device)
         matrix = mr2.data.SpatialDimension(1, size_y, size_x)
         nufft = mr2.operators.NonUniformFastFourierOp(
             direction=(-2, -1),
@@ -300,7 +317,7 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
             encoding_matrix=matrix,
             traj=traj,
         )
-        dcf_numpy = dcf.data.numpy()
+        dcf_numpy = acquisition.dcf.data.numpy()
         dictionary_match = create_dictionary_matcher(device, batch_size=config.dictionary_batch_size)
 
         with h5py.File(tmp_path, 'w') as target, torch.inference_mode():
@@ -336,16 +353,27 @@ def convert_file(source_path: Path, output_root: Path, *, config: ConversionConf
                 expected_shape = (n_timepoints, N_COMPRESSED_COILS, 1, 1, n_readout_samples)
                 if kspace.shape != expected_shape:
                     raise RuntimeError(f'NUFFT returned shape {tuple(kspace.shape)}, expected {expected_shape}.')
-                target['kspace'][z] = kspace.cpu().numpy().astype(np.complex64)
+                target['kspace'][z] = (DELICS_KSPACE_SCALE * kspace).cpu().numpy().astype(np.complex64)
                 target['mask'][z] = mask
                 target['valid'][z] = mask_valid and bool(torch.isfinite(frames).all().item())
                 csm, csm_valid = estimate_csm(frames_2d)
                 target['csm_initial'][z] = csm
                 target['csm_valid'][z] = csm_valid
                 reference_m0, reference_t1, reference_t2 = dictionary_match_reference(frames, csm, dictionary_match)
-                target['reference_m0'][z] = reference_m0
+                target['reference_m0'][z] = (DELICS_KSPACE_SCALE * reference_m0).astype(np.complex64)
                 target['reference_t1'][z] = reference_t1
                 target['reference_t2'][z] = reference_t2
+
+            reference_m0_abs = np.abs(target['reference_m0'][()])
+            initially_valid = target['valid'][()] & target['csm_valid'][()]
+            central_reference_m0 = reference_m0_abs[5:-20]
+            if central_reference_m0.size == 0:
+                central_reference_m0 = reference_m0_abs
+            threshold = np.percentile(central_reference_m0, 90) * 0.05
+            good = initially_valid & ((reference_m0_abs > threshold).mean(axis=(-1, -2)) > 0.1)
+            if good.any():
+                good[: np.argmax(good) + 8] = False
+            target['valid'][:] = good
 
         tmp_path.replace(output_path)
         return output_path
@@ -356,22 +384,65 @@ def find_source_files(input_root: Path, case_glob: str) -> list[Path]:
     return sorted(path for path in input_root.glob(case_glob) if path.is_file())
 
 
-def convert_all(config: ConversionConfig) -> list[Path]:
+def convert_files_on_gpu(task: tuple[list[Path], ConversionConfig, int, int]) -> list[Path]:
+    """Convert a shard of source files in one GPU-pinned worker process."""
+    source_paths, config, gpu_index, position = task
+    _ = position
+    configure_worker_threads(config.threads_per_worker)
+    torch.cuda.set_device(gpu_index)
+    device = torch.device(f'cuda:{gpu_index}')
+    outputs = []
+    for source_path in source_paths:
+        outputs.append(convert_file(source_path, config.output_root, config=config, device=device))
+        torch.cuda.empty_cache()
+    return outputs
+
+
+def convert_all(config: ConversionConfig, *, num_workers: int = 1) -> list[Path]:
     """Convert all matching DELICS H5 files."""
-    os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
-    os.environ.setdefault('OMP_NUM_THREADS', '1')
-    os.environ.setdefault('MKL_NUM_THREADS', '1')
-    os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
-    device = torch.device('cuda')
+    configure_worker_threads(config.threads_per_worker)
     config.output_root.mkdir(parents=True, exist_ok=True)
     source_files = find_source_files(config.input_root, config.case_glob)
     if not source_files:
         raise FileNotFoundError(f'No files matching {config.case_glob!r} found in {config.input_root}.')
+    if num_workers < 1:
+        raise ValueError('num_workers must be at least 1.')
+    for source_path in source_files:
+        with h5py.File(source_path, 'r') as source:
+            validate_source(source, source_path)
+            case = source_case_id(source_path, source)
+        output_path = config.output_root / f'delics_radial_{case}.h5'
+        if output_path.exists() and not config.overwrite:
+            raise FileExistsError(f'{output_path} already exists. Use --overwrite to replace it.')
+    if not torch.cuda.is_available():
+        raise RuntimeError('DELICS conversion requires CUDA.')
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < 1:
+        raise RuntimeError('No CUDA devices are available.')
+    num_workers = min(num_workers, len(source_files), n_gpus)
+    if num_workers == 1:
+        device = torch.device('cuda:0')
+        outputs = []
+        progress = tqdm(source_files, desc='DELICS files', unit='file', position=0)
+        for source_path in progress:
+            progress.set_postfix_str(source_path.name)
+            outputs.append(convert_file(source_path, config.output_root, config=config, device=device))
+        return outputs
+
+    tasks = [
+        (source_files[worker_index::num_workers], config, worker_index, worker_index + 1)
+        for worker_index in range(num_workers)
+        if source_files[worker_index::num_workers]
+    ]
     outputs = []
-    progress = tqdm(source_files, desc='DELICS files', unit='file', position=0)
-    for source_path in progress:
-        progress.set_postfix_str(source_path.name)
-        outputs.append(convert_file(source_path, config.output_root, config=config, device=device))
+    context = mp.get_context('spawn')
+    with (
+        context.Pool(processes=num_workers) as pool,
+        tqdm(total=len(source_files), desc='DELICS files', unit='file', position=0) as progress,
+    ):
+        for worker_outputs in pool.imap_unordered(convert_files_on_gpu, tasks):
+            outputs.extend(worker_outputs)
+            progress.update(len(worker_outputs))
     return outputs
 
 
@@ -384,6 +455,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--n-readout-samples', type=int, default=None)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--dictionary-batch-size', type=int, default=DEFAULT_DICTIONARY_BATCH_SIZE)
+    parser.add_argument('--num-workers', type=int, default=1)
+    parser.add_argument('--threads-per-worker', type=int, default=DEFAULT_THREADS_PER_WORKER)
     return parser
 
 
@@ -398,8 +471,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_readout_samples=args.n_readout_samples,
         overwrite=args.overwrite,
         dictionary_batch_size=args.dictionary_batch_size,
+        threads_per_worker=args.threads_per_worker,
     )
-    outputs = convert_all(config)
+    outputs = convert_all(config, num_workers=args.num_workers)
     for output in outputs:
         sys.stdout.write(f'{output}\n')
 

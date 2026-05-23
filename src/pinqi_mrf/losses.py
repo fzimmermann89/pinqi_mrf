@@ -6,6 +6,7 @@ import mr2
 import torch
 
 
+@torch.compile
 def charbonnier_loss(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -21,6 +22,7 @@ def charbonnier_loss(
     return loss
 
 
+@torch.compile
 def ssim_loss(
     predictions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -34,6 +36,7 @@ def ssim_loss(
     for prediction, target in zip(predictions, targets, strict=True):
         prediction = prediction.clamp(lower, upper)
         target = target.clamp(lower, upper)
-        (ssim,) = mr2.operators.functionals.SSIM(target, mask, data_range=torch.tensor(upper - lower))(prediction)
+        data_range = torch.tensor(upper - lower)
+        (ssim,) = mr2.operators.functionals.SSIM(target, mask, data_range=data_range)(prediction)
         loss = loss + (1 - ssim)
     return loss
