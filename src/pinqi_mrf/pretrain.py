@@ -20,6 +20,9 @@ class PretrainHParams(Protocol):
     csm_extrapolate: bool
     use_density_compensation: bool
     weight_scaling: bool
+    ema_eval: bool
+    ema_decay: float
+    ema_update_interval: int
     normalize_inputs: bool
     n_subspace_coefficients: int
     use_image_net: bool
