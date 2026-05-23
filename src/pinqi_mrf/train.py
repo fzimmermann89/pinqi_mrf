@@ -1,7 +1,8 @@
 """Shared training infrastructure for PINQI-MRF Lightning modules."""
 
+import copy
 import gc
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -12,6 +13,7 @@ import matplotlib.pyplot as plt
 import mr2
 import numpy as np
 import torch
+from lightning.pytorch.core.optimizer import LightningOptimizer
 from lightning.pytorch.utilities.types import OptimizerLRSchedulerConfig
 from matplotlib.colors import Colormap
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
@@ -91,6 +93,9 @@ class BaseModule(pl.LightningModule):
         trajectory: str = 'radial',
         use_density_compensation: bool = False,  # noqa: ARG002
         weight_scaling: bool = True,
+        ema_eval: bool = True,  # noqa: ARG002
+        ema_decay: float = 0.97,
+        ema_update_interval: int = 4,
         normalize_inputs: bool = True,
         use_image_net: bool = True,
         use_parameter_net: bool = True,
@@ -121,6 +126,10 @@ class BaseModule(pl.LightningModule):
     ) -> None:
         """Initialize the shared reconstruction state."""
         super().__init__()
+        if not 0 <= ema_decay <= 1:
+            raise ValueError(f'ema_decay must be in [0, 1], got {ema_decay}.')
+        if ema_update_interval < 1:
+            raise ValueError(f'ema_update_interval must be positive, got {ema_update_interval}.')
         self.save_hyperparameters(ignore=['signalmodel'])
         self.parameter_transform = LogRelaxationTransform(bounds=relaxation_bounds)
         self.signalmodel = SubspaceLookup(
@@ -165,6 +174,9 @@ class BaseModule(pl.LightningModule):
             use_parameter_net=use_parameter_net,
             use_dictionary_match=use_dictionary_match,
         )
+        self.pinqi_ema = copy.deepcopy(self.pinqi)
+        self.pinqi_ema.requires_grad_(False)
+        self.pinqi_ema.eval()
         self.baseline = BaselineReconstruction(
             signalmodel=self.signalmodel,
             parameter_ranges=parameter_ranges,
@@ -190,6 +202,14 @@ class BaseModule(pl.LightningModule):
             for key in tuple(state_dict):
                 if key.startswith(('subspace_gram.', 'noise_sampler.', 'current_subspace_gram_in.')):
                     del state_dict[key]
+            if not any(key.startswith('pinqi_ema.') for key in state_dict):
+                state_dict.update(
+                    {
+                        key.replace('pinqi.', 'pinqi_ema.', 1): value
+                        for key, value in state_dict.items()
+                        if key.startswith('pinqi.')
+                    }
+                )
 
     @property
     def n_compressed_coils(self) -> int:
@@ -205,6 +225,28 @@ class BaseModule(pl.LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
         self.setup_acquisition()
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer | LightningOptimizer,
+        optimizer_closure: Callable[[], Any] | None = None,
+    ) -> None:
+        """Run an optimizer update and update EMA weights at the configured interval."""
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        if (self.global_step + 1) % self.hparams.ema_update_interval:
+            return
+        with torch.no_grad():
+            student_state = self.pinqi.state_dict()
+            ema_state = self.pinqi_ema.state_dict()
+            for key, ema_value in ema_state.items():
+                student_value = student_state[key].detach().to(ema_value.device)
+                if torch.is_floating_point(ema_value) or torch.is_complex(ema_value):
+                    ema_value.mul_(self.hparams.ema_decay).add_(student_value, alpha=1.0 - self.hparams.ema_decay)
+                else:
+                    ema_value.copy_(student_value)
+        self.pinqi_ema.eval()
 
     def setup_acquisition(self) -> None:
         """Create fixed acquisition operators on the active device."""
@@ -303,6 +345,8 @@ class BaseModule(pl.LightningModule):
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
         csm_initial = csm_initial if csm_initial is not None else self.estimate_initial_csm(coil_rhs)
+        if not self.training and self.hparams.ema_eval:
+            return self.pinqi_ema(coil_rhs, csm_initial, self.subspace_gram, weight_scale=self.subspace_gram_scale)
         return self.pinqi(coil_rhs, csm_initial, self.subspace_gram, weight_scale=self.subspace_gram_scale)
 
     def simulate_coil_rhs(self, batch: BatchType) -> tuple[torch.Tensor, torch.Tensor]:
@@ -450,8 +494,8 @@ class BaseModule(pl.LightningModule):
         )
         coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft, coilwise=True)
         csm_initial = self.estimate_initial_csm(coil_rhs)
-        rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
-        rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
+        rhs, normal_op = PINQI.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
+        rhs, normal_op = PINQI.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
         _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
         baseline_parameters = self.baseline(rhs, normal_op)
         return parameters[-1], baseline_parameters
@@ -688,8 +732,8 @@ class BaseModule(pl.LightningModule):
             self.log_csm_diagnostics(csm_initial, prefix=f'debug/{prefix}/csm')
         if self.subspace_gram is None:
             raise RuntimeError('Acquisition operators have not been initialized.')
-        rhs, normal_op = self.pinqi.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
-        rhs, normal_op = self.pinqi.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
+        rhs, normal_op = PINQI.get_normal_equations(coil_rhs, csm_initial, self.subspace_gram)
+        rhs, normal_op = PINQI.scale_linear_system(rhs, normal_op, self.subspace_gram_scale)
         _images, parameters, _csm_final = self(coil_rhs, csm_initial=csm_initial)
         loss, components = self.supervised_parameter_loss(parameters, batch)
         prediction_parameters = parameters[-1]

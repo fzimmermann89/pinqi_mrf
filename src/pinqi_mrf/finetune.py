@@ -1,14 +1,12 @@
 """DELICS fine-tuning module for PINQI-MRF."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
 import einops
 import mr2
 import torch
-import torch.distributed as dist
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from mr2.operators.NonUniformFastFourierOp import SubspaceNonUniformFastFourierOpGramOp
 
@@ -22,15 +20,6 @@ TEACHER_GAMMA_RANGE = (0.8, 1.2)
 TEACHER_MAX_GLOBAL_SHIFT = 0.1
 
 
-@dataclass(frozen=True)
-class TeacherSlice:
-    """Teacher pseudo-reference data for one DELICS slice."""
-
-    targets: tuple[torch.Tensor, ...]
-    mask: torch.Tensor
-    csm: torch.Tensor
-
-
 class FineTuneHParams(PretrainHParams, Protocol):
     """Typed view of fine-tuning-specific hyperparameters."""
 
@@ -38,9 +27,7 @@ class FineTuneHParams(PretrainHParams, Protocol):
     pretrained_checkpoint_strict: bool
     teacher_generated_loss_weight: float
     teacher_augmentations_per_step: int
-    teacher_spatial_augmentation: bool
-    teacher_mix_probability: float
-    teacher_mix_beta: float
+    teacher_flip_probability: float
     ssdu_loss_fraction: float
     ssdu_loss_weight: float
     ssdu_normal_loss_weight: float
@@ -56,6 +43,7 @@ class FineTuneModule(BaseModule):
     current_nufft_loss: mr2.operators.NonUniformFastFourierOp | None
     current_subspace_gram_in: SubspaceNonUniformFastFourierOpGramOp | None
     current_subspace_gram_loss: SubspaceNonUniformFastFourierOpGramOp | None
+    teacher_nufft: mr2.operators.NonUniformFastFourierOp | None
 
     def __init__(
         self,
@@ -63,9 +51,7 @@ class FineTuneModule(BaseModule):
         pretrained_checkpoint_strict: bool = True,
         teacher_generated_loss_weight: float = 0.3,  # Similar gradient scale: 0.4 with synthetic anchor weight 1.
         teacher_augmentations_per_step: int = 2,
-        teacher_spatial_augmentation: bool = True,
-        teacher_mix_probability: float = 0.25,
-        teacher_mix_beta: float = 0.4,
+        teacher_flip_probability: float = 0.2,
         ssdu_loss_fraction: float = 0.2,
         ssdu_loss_weight: float = 0.0,  # Similar gradient scale: 0.2 with synthetic anchor weight 1.
         ssdu_normal_loss_weight: float = 0.2,  # Similar gradient scale: 0.1 with synthetic anchor weight 1.
@@ -79,10 +65,8 @@ class FineTuneModule(BaseModule):
             raise ValueError('ssdu_loss_fraction must be in (0, 1).')
         if teacher_augmentations_per_step < 0:
             raise ValueError('teacher_augmentations_per_step must be non-negative.')
-        if not 0 <= teacher_mix_probability <= 1:
-            raise ValueError('teacher_mix_probability must be in [0, 1].')
-        if teacher_mix_beta <= 0:
-            raise ValueError('teacher_mix_beta must be positive.')
+        if not 0 <= teacher_flip_probability <= 1:
+            raise ValueError('teacher_flip_probability must be in [0, 1].')
         if ssdu_loss_weight < 0:
             raise ValueError('ssdu_loss_weight must be non-negative.')
         if ssdu_normal_loss_weight < 0:
@@ -93,9 +77,7 @@ class FineTuneModule(BaseModule):
                 'pretrained_checkpoint_strict': pretrained_checkpoint_strict,
                 'teacher_generated_loss_weight': teacher_generated_loss_weight,
                 'teacher_augmentations_per_step': teacher_augmentations_per_step,
-                'teacher_spatial_augmentation': teacher_spatial_augmentation,
-                'teacher_mix_probability': teacher_mix_probability,
-                'teacher_mix_beta': teacher_mix_beta,
+                'teacher_flip_probability': teacher_flip_probability,
                 'ssdu_loss_fraction': ssdu_loss_fraction,
                 'ssdu_loss_weight': ssdu_loss_weight,
                 'ssdu_normal_loss_weight': ssdu_normal_loss_weight,
@@ -115,7 +97,9 @@ class FineTuneModule(BaseModule):
         self.current_subspace_gram_in_scale: torch.Tensor | None = None
         self.current_subspace_gram_loss: SubspaceNonUniformFastFourierOpGramOp | None = None
         self.current_subspace_gram_loss_scale: torch.Tensor | None = None
-        self.teacher_cache: dict[tuple[int, int], TeacherSlice] = {}
+        self.teacher_acquisition: AcquisitionData | None = None
+        self.teacher_subspace_basis: torch.Tensor | None = None
+        self.teacher_nufft: mr2.operators.NonUniformFastFourierOp | None = None
         if pretrained_checkpoint is not None:
             self.load_pretrained_checkpoint(pretrained_checkpoint, strict=pretrained_checkpoint_strict)
 
@@ -134,6 +118,15 @@ class FineTuneModule(BaseModule):
         state_dict = checkpoint['state_dict']
         if not isinstance(state_dict, dict):
             raise TypeError(f'{checkpoint_path} state_dict must be a dictionary.')
+        state_dict = dict(state_dict)
+        if not any(key.startswith('pinqi_ema.') for key in state_dict):
+            state_dict.update(
+                {
+                    key.replace('pinqi.', 'pinqi_ema.', 1): value
+                    for key, value in state_dict.items()
+                    if key.startswith('pinqi.')
+                }
+            )
         incompatible_keys = self.load_state_dict(cast(dict[str, torch.Tensor], state_dict), strict=strict)
         if not strict and (incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
             missing = ', '.join(incompatible_keys.missing_keys) or 'none'
@@ -141,7 +134,7 @@ class FineTuneModule(BaseModule):
             rank_zero_info(f'Loaded pretrained checkpoint with missing keys: {missing}; unexpected keys: {unexpected}')
 
     def on_fit_start(self) -> None:
-        """Defer SSDU operator construction to epoch start."""
+        """Initialize online EMA teacher state."""
         super().on_fit_start()
         if (
             self.hparams.teacher_generated_loss_weight
@@ -149,6 +142,8 @@ class FineTuneModule(BaseModule):
             and self.trainer.ckpt_path is None
         ):
             raise RuntimeError('Teacher fine-tuning requires pretrained_checkpoint or trainer ckpt_path.')
+        if self.hparams.teacher_generated_loss_weight:
+            self.setup_teacher_operator()
 
     def on_validation_start(self) -> None:
         """Defer SSDU operator construction to epoch start."""
@@ -157,8 +152,20 @@ class FineTuneModule(BaseModule):
     def on_train_epoch_start(self) -> None:
         """Update the epoch-wise SSDU split and visible normal operator."""
         self.setup_ssdu_split()
-        if self.hparams.teacher_generated_loss_weight:
-            self.refresh_teacher_cache()
+
+    def setup_teacher_operator(self) -> None:
+        """Create the full-data teacher NUFFT runtime state."""
+        acquisition = self.acquisition.to(self.device)
+        subspace_basis = self._subspace_basis(torch.arange(self.signalmodel.n_timepoints))
+        nufft = mr2.operators.NonUniformFastFourierOp(
+            direction=(-2, -1),
+            recon_matrix=self.matrix_size,
+            encoding_matrix=self.matrix_size,
+            traj=acquisition.trajectory.to(self.device),
+        )
+        self.teacher_acquisition = acquisition
+        self.teacher_subspace_basis = subspace_basis
+        self.set_runtime_state('teacher_nufft', nufft)
 
     def _sample_ssdu_split(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample visible and held-out time indices for the current epoch."""
@@ -212,7 +219,7 @@ class FineTuneModule(BaseModule):
         self.current_subspace_gram_loss_scale = None
         if self.hparams.ssdu_normal_loss_weight:
             loss_gram = nufft_loss.toeplitz(weight=weight_loss, subspace=basis_loss, subspace_dim=1)
-            (self.set_runtime_state('current_subspace_gram_loss', loss_gram),)
+            self.set_runtime_state('current_subspace_gram_loss', loss_gram)
             if self.hparams.weight_scaling:
                 self.current_subspace_gram_loss_scale = self.estimate_subspace_gram_scale(loss_gram)
         else:
@@ -227,73 +234,6 @@ class FineTuneModule(BaseModule):
         self.current_subspace_gram_in_scale = (
             self.estimate_subspace_gram_scale(self.current_subspace_gram_in) if self.hparams.weight_scaling else None
         )
-
-    def refresh_teacher_cache(self) -> None:
-        """Predict epoch-level teacher parameter maps for the DELICS training dataset."""
-        datamodule = getattr(self.trainer, 'datamodule', None)
-        dataset = getattr(datamodule, 'delics_train_dataset', None)
-        if dataset is None:
-            raise RuntimeError('Teacher refresh requires a datamodule with a delics_train_dataset.')
-        world_size = int(getattr(self.trainer, 'world_size', 1))
-        global_rank = int(getattr(self.trainer, 'global_rank', 0))
-
-        acquisition = self.acquisition.to(self.device)
-        subspace_basis = self._subspace_basis(torch.arange(self.signalmodel.n_timepoints))
-        nufft = mr2.operators.NonUniformFastFourierOp(
-            direction=(-2, -1),
-            recon_matrix=self.matrix_size,
-            encoding_matrix=self.matrix_size,
-            traj=acquisition.trajectory.to(self.device),
-        )
-        weight = acquisition.dcf.data if self.hparams.use_density_compensation else None
-        teacher_subspace_gram = cast(
-            SubspaceNonUniformFastFourierOpGramOp,
-            nufft.toeplitz(weight=weight, subspace=subspace_basis, subspace_dim=1),
-        )
-        teacher_weight_scale = self.subspace_gram_scale if self.hparams.weight_scaling else None
-
-        self.teacher_cache.clear()
-        was_training = self.training
-        self.eval()
-        local_teacher_slices: list[tuple[int, TeacherSlice]] = []
-        with torch.no_grad():
-            for index in range(global_rank, len(dataset), world_size):
-                sample = dataset[index]
-                kspace = cast(torch.Tensor, sample['kspace'])[None].to(self.device)
-                coil_rhs = self.build_coil_rhs(kspace, acquisition, subspace_basis, nufft)
-                csm_initial = self.estimate_initial_csm(coil_rhs)
-                _images, parameters, csm_final = self.pinqi(
-                    coil_rhs,
-                    csm_initial,
-                    teacher_subspace_gram,
-                    weight_scale=teacher_weight_scale,
-                )
-                local_teacher_slices.append(
-                    (
-                        index,
-                        TeacherSlice(
-                            targets=tuple(parameter[0].detach().cpu() for parameter in parameters[-1]),
-                            mask=cast(torch.Tensor, sample['mask']).cpu().bool(),
-                            csm=csm_final[0].detach().cpu(),
-                        ),
-                    )
-                )
-        self.train(was_training)
-        world_size = int(getattr(self.trainer, 'world_size', 1))
-        if world_size > 1 and dist.is_available() and dist.is_initialized():
-            gathered_teacher_slices: list[list[tuple[int, TeacherSlice]]] = [[] for _ in range(world_size)]
-            dist.all_gather_object(gathered_teacher_slices, local_teacher_slices)
-            teacher_slices = [
-                teacher_slice
-                for rank_teacher_slices in gathered_teacher_slices
-                for teacher_slice in rank_teacher_slices
-            ]
-        else:
-            teacher_slices = local_teacher_slices
-        for dataset_index, teacher_slice in teacher_slices:
-            file_index, slice_index = dataset.samples[dataset_index]
-            self.teacher_cache[(file_index, slice_index)] = teacher_slice
-        rank_zero_info(f'Refreshed {len(self.teacher_cache)} DELICS teacher pseudo-reference slices.')
 
     def build_visible_coil_rhs(self, kspace: torch.Tensor) -> torch.Tensor:
         """Build coilwise subspace RHS from the current visible k-space split."""
@@ -385,103 +325,39 @@ class FineTuneModule(BaseModule):
         mask: torch.Tensor,
         csm: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
-        """Apply teacher-map geometric/value augmentation and independent CSM flips."""
-        if not self.hparams.teacher_spatial_augmentation:
-            return self._apply_teacher_intensity_augmentation(targets, mask), mask, csm
-
-        shape = targets[0].shape
-        csm_shape = csm.shape
-        csm_channels = csm.shape[1] * csm.shape[2]
-        target_specs: list[tuple[tuple[int, ...], bool, int]] = []
-        channel_parts = []
-        for target in targets:
-            flattened = target.reshape(shape[0], -1, *shape[-2:])
-            if torch.is_complex(target):
-                channel_parts.append(flattened.real)
-                channel_parts.append(flattened.imag)
-            else:
-                channel_parts.append(flattened)
-            target_specs.append((tuple(target.shape), torch.is_complex(target), flattened.shape[1]))
-        channels = torch.cat(
-            (
-                *channel_parts,
-                mask[:, None].float(),
-                csm.real.reshape(shape[0], -1, *shape[-2:]),
-                csm.imag.reshape(shape[0], -1, *shape[-2:]),
-            ),
-            dim=1,
-        )
-        augment = mr2.phantoms.brainweb.augment(
-            size=shape[-1],
-            trim=False,
-            max_random_shear=3,
-            max_random_rotation=5,
-            max_random_scaling_factor=0.05,
-            p_horizontal_flip=0.5,
-            p_vertical_flip=0.0,
-        )
-        augmented = torch.stack([augment(sample) for sample in channels])
-
-        augmented_target_list: list[torch.Tensor] = []
-        channel_offset = 0
-        for target_shape, is_complex, channel_count in target_specs:
-            if is_complex:
-                real_part = augmented[:, channel_offset : channel_offset + channel_count]
-                imag_part = augmented[:, channel_offset + channel_count : channel_offset + 2 * channel_count]
-                augmented_target_list.append(torch.complex(real_part, imag_part).reshape(target_shape))
-                channel_offset += 2 * channel_count
-            else:
-                augmented_target_list.append(
-                    augmented[:, channel_offset : channel_offset + channel_count].reshape(target_shape)
+        """Apply optional independent left-right flips before teacher-map value augmentation."""
+        augmented_targets = targets
+        augmented_mask = mask
+        augmented_csm = csm
+        if self.hparams.teacher_flip_probability:
+            batch_size = targets[0].shape[0]
+            use_flips = torch.rand((batch_size,), device=self.device) < self.hparams.teacher_flip_probability
+            flip_components = torch.rand((batch_size, len(targets) + 1), device=self.device) < 0.5
+            target_flip_shape = (batch_size,) + (1,) * (targets[0].ndim - 1)
+            mask_flip_shape = (batch_size,) + (1,) * (mask.ndim - 1)
+            csm_flip_shape = (batch_size,) + (1,) * (csm.ndim - 1)
+            augmented_targets = tuple(
+                torch.where(
+                    (use_flips & flip_components[:, index]).reshape(target_flip_shape),
+                    torch.flip(target, dims=(-1,)),
+                    target,
                 )
-                channel_offset += channel_count
-        map_mask = augmented[:, channel_offset] > 0.5
-        channel_offset += 1
-        csm_real = augmented[:, channel_offset : channel_offset + csm_channels]
-        csm_imag = augmented[:, channel_offset + csm_channels : channel_offset + 2 * csm_channels]
-        augmented_csm = torch.complex(csm_real, csm_imag).reshape(csm_shape)
-
-        batch_size = map_mask.shape[0]
-        csm_flip = torch.rand((batch_size,), device=self.device) < 0.5
-        mask_flip_shape = (batch_size,) + (1,) * (map_mask.ndim - 1)
-        csm_flip_shape = (batch_size,) + (1,) * (augmented_csm.ndim - 1)
-
-        csm_flip_csm = csm_flip.reshape(csm_flip_shape)
-        csm_flip_mask = csm_flip.reshape(mask_flip_shape)
-        flipped_csm = torch.where(csm_flip_csm, torch.flip(augmented_csm, dims=(-1,)), augmented_csm)
-        csm_mask = torch.where(csm_flip_mask, torch.flip(map_mask, dims=(-1,)), map_mask)
-        augmented_mask = map_mask & csm_mask
-        augmented_targets = self._apply_teacher_intensity_augmentation(tuple(augmented_target_list), augmented_mask)
-        return augmented_targets, augmented_mask, flipped_csm
-
-    def maybe_mix_teacher_batch(
-        self,
-        targets: tuple[torch.Tensor, ...],
-        mask: torch.Tensor,
-        csm: torch.Tensor,
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
-        """Optionally mix teacher maps with another cached teacher slice."""
-        if self.hparams.teacher_mix_probability == 0 or not self.teacher_cache:
-            return targets, mask, csm
-        if torch.rand((), device=self.device) >= self.hparams.teacher_mix_probability:
-            return targets, mask, csm
-        keys = sorted(self.teacher_cache)
-        key_index = int(torch.randint(len(keys), (), device=self.device).item())
-        other_slice = self.teacher_cache[keys[key_index]]
-        other_targets = tuple(target[None].to(self.device) for target in other_slice.targets)
-        other_mask = other_slice.mask[None].to(self.device).bool()
-        concentration = torch.tensor(self.hparams.teacher_mix_beta, device=self.device)
-        lam = torch.distributions.Beta(concentration, concentration).sample((1,)).to(self.device)
-        lam = mr2.utils.unsqueeze_at(lam, dim=-1, n=targets[0].ndim - lam.ndim)
-        mixed_targets = tuple(
-            lam * target + (1 - lam) * other for target, other in zip(targets, other_targets, strict=True)
-        )
-        return mixed_targets, mask & other_mask, csm
+                for index, target in enumerate(targets)
+            )
+            augmented_csm = torch.where(
+                (use_flips & flip_components[:, -1]).reshape(csm_flip_shape), torch.flip(csm, dims=(-1,)), csm
+            )
+            use_flipped_mask = use_flips & flip_components.any(dim=1)
+            augmented_mask = torch.where(
+                use_flipped_mask.reshape(mask_flip_shape), mask & torch.flip(mask, dims=(-1,)), mask
+            )
+        augmented_targets = self._apply_teacher_intensity_augmentation(augmented_targets, augmented_mask)
+        return augmented_targets, augmented_mask, augmented_csm
 
     def teacher_parameter_loss(
         self, predictions: Sequence[tuple[torch.Tensor, ...]], targets: tuple[torch.Tensor, ...], mask: torch.Tensor
     ) -> torch.Tensor:
-        """Compute masked parameter loss against cached teacher maps."""
+        """Compute masked parameter loss against teacher maps."""
         prediction_tensors = tuple(parameter.squeeze(1, 2) for parameter in predictions[-1])
         target_tensors = tuple(target.squeeze(1, 2) for target in targets)
         parameter_mask = mask.bool().clone()
@@ -607,12 +483,7 @@ class FineTuneModule(BaseModule):
         mask = batch['mask'].to(self.device).bool()
         loss_sum = torch.zeros((), device=self.device)
         for _augmentation_index in range(n_augmentations):
-            mixed_targets, mixed_mask, mixed_csm = self.maybe_mix_teacher_batch(targets, mask, csm)
-            augmented_targets, augmented_mask, augmented_csm = self.augment_teacher_batch(
-                mixed_targets,
-                mixed_mask,
-                mixed_csm,
-            )
+            augmented_targets, augmented_mask, augmented_csm = self.augment_teacher_batch(targets, mask, csm)
             synthetic_parameters = self.reconstruct_parameters_from_teacher_maps(augmented_targets, augmented_csm)
             loss_sum = loss_sum + self.teacher_parameter_loss(synthetic_parameters, augmented_targets, augmented_mask)
         return loss_sum / n_augmentations
@@ -625,21 +496,32 @@ class FineTuneModule(BaseModule):
         return self.supervised_parameter_loss(parameters, batch)
 
     def teacher_targets_for_batch(self, batch: DelicsRadialBatch) -> tuple[ParameterTuple, torch.Tensor]:
-        """Fetch teacher targets and CSMs for a DELICS batch."""
-        teacher_slices = []
-        for case_id, slice_index in zip(batch['case_id'], batch['slice_index'], strict=True):
-            key = (int(case_id.item()), int(slice_index.item()))
-            if key not in self.teacher_cache:
-                raise RuntimeError(
-                    f'Missing teacher pseudo-reference for case {int(case_id.item())} slice {int(slice_index.item())}.'
-                )
-            teacher_slices.append(self.teacher_cache[key])
-        teacher_targets = tuple(
-            torch.stack(items).to(self.device)
-            for items in zip(*(teacher_slice.targets for teacher_slice in teacher_slices), strict=True)
-        )
-        teacher_csm = torch.stack([teacher_slice.csm for teacher_slice in teacher_slices]).to(self.device)
-        return teacher_targets, teacher_csm
+        """Predict teacher targets for a DELICS batch with the online EMA model."""
+        if self.teacher_nufft is None:
+            self.setup_teacher_operator()
+        if (
+            self.teacher_acquisition is None
+            or self.teacher_subspace_basis is None
+            or self.teacher_nufft is None
+            or self.subspace_gram is None
+        ):
+            raise RuntimeError('Online EMA teacher has not been initialized.')
+        self.pinqi_ema.eval()
+        with torch.no_grad():
+            coil_rhs = self.build_coil_rhs(
+                batch['kspace'],
+                self.teacher_acquisition,
+                self.teacher_subspace_basis,
+                self.teacher_nufft,
+            )
+            csm_initial = self.estimate_initial_csm(coil_rhs)
+            _images, parameters, csm_final = self.pinqi_ema(
+                coil_rhs,
+                csm_initial,
+                self.subspace_gram,
+                weight_scale=self.subspace_gram_scale,
+            )
+        return tuple(parameter.detach() for parameter in parameters[-1]), csm_final.detach()
 
     def delics_loss(self, batch: DelicsRadialBatch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DELICS fine-tuning loss components for one batch."""
@@ -668,9 +550,9 @@ class FineTuneModule(BaseModule):
         synthetic_loss, synthetic_components = self.synthetic_anchor_loss(batch['synthetic'])
         loss = delics_loss + self.hparams.synthetic_anchor_loss_weight * synthetic_loss
         self.log('train/loss', loss, on_epoch=True, prog_bar=True)  # on_step is true automatically in training_step
-        self.log('train/ssdu_kspace_loss', components['ssdu_kspace'], on_epoch=True)
+        self.log('train/ssdu_kspace_loss', components['ssdu_kspace'], on_epoch=True, sync_dist=False)
         if self.hparams.ssdu_normal_loss_weight:
-            self.log('train/ssdu_normal_loss', components['ssdu_normal'], on_epoch=True, sync_dist=True)
+            self.log('train/ssdu_normal_loss', components['ssdu_normal'], on_epoch=True, sync_dist=False)
         if self.hparams.teacher_generated_loss_weight:
             self.log('train/teacher_generated_loss', components['teacher_generated'], on_epoch=True)
         if self.hparams.synthetic_anchor_loss_weight:
