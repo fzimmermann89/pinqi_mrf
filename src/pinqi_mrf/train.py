@@ -361,7 +361,8 @@ class BaseModule(pl.LightningModule):
         csm_op = mr2.operators.SensitivityOp(batch['csm'][:, None])
         (coil_coefficients,) = csm_op(coefficients)
         (coil_rhs,) = self.subspace_gram(coil_coefficients)
-        coil_rhs = coil_rhs + self.noise_sampler(batch['noise_std'])
+        if batch['noise_std'].abs().amax() > 0:
+            coil_rhs = coil_rhs + self.noise_sampler(batch['noise_std'])
         return self.compress_coils(coil_rhs, batch['csm'])
 
     def supervised_parameter_loss(
