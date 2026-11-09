@@ -1,7 +1,4 @@
-"""Train the five learned BrainWeb saturation-recovery methods.
-
-Example: python train.py pinqi-dictionary --brainweb /path/to/brainweb --output runs/pinqi-dictionary
-"""
+"""Train the five learned BrainWeb saturation-recovery methods."""
 
 import argparse
 import json
@@ -9,11 +6,12 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
-from data import BrainWebData, Sample
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, Logger, WandbLogger
 from lightning.pytorch.utilities.types import OptimizerLRSchedulerConfig
-from models import PINQI, T1_BOUNDS, Fitter, MoDL, masked_ssim, metrics, normalize
+
+from pinqi_mrf.saturation_recovery.data import BrainWebData, Sample
+from pinqi_mrf.saturation_recovery.models import PINQI, T1_BOUNDS, Fitter, MoDL, masked_ssim, metrics, normalize
 
 METHODS = ('modl', 'modl-dictionary', 'modl-lbfgs', 'pinqi-dictionary', 'pinqi-lbfgs')
 
@@ -22,7 +20,7 @@ class Experiment(pl.LightningModule):
     """Selected L1/SSIM recipe; fitting enters training only in the end-to-end methods."""
 
     def __init__(self, method: str, learning_rate: float | None = None) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         super().__init__()
         if method not in METHODS:
             raise ValueError(f'Unknown method: {method}')
@@ -73,7 +71,9 @@ class Experiment(pl.LightningModule):
         sample = normalize(batch)
         m0, t1 = self.model.estimate(sample)
         for name, value in metrics(m0, t1, sample).items():
-            self.log(f'val/{name}', value.nanmean(), batch_size=len(batch['index']))
+            valid = value.isfinite()
+            if valid.any():
+                self.log(f'val/{name}', value[valid].mean(), batch_size=int(valid.sum()))
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
         """AdamW with a 20% warmup and cosine decay over the complete training run."""
@@ -97,7 +97,7 @@ class Experiment(pl.LightningModule):
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Train, retaining the full final state and the best validation-MAE checkpoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('method', choices=METHODS)
@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--wandb', action='store_true', help='Also log to the pinqi-mrf W&B project.')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision('high')
     data = BrainWebData(args.brainweb, args.batch_size, args.workers)

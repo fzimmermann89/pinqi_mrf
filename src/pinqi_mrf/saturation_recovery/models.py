@@ -7,8 +7,9 @@ from typing import Literal
 import mr2
 import torch
 import torch.nn.functional as functional
-from data import DELAYS, Sample, acquisition_op
 from torch.utils.checkpoint import checkpoint
+
+from pinqi_mrf.saturation_recovery.data import DELAYS, Sample, acquisition_op
 
 Fitter = Literal['dictionary', 'lbfgs']
 T1_BOUNDS = (0.05, 6.0)
@@ -122,7 +123,7 @@ class Reconstruction(torch.nn.Module):
     fit: DictionaryFit | OptimizerFit
 
     def __init__(self, fitter: Fitter) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         super().__init__()
         self.cg_iterations = 20
         self.image_net = mr2.nn.ComplexAsChannel(
@@ -167,7 +168,7 @@ class MoDL(Reconstruction):
     """MoDL with a stage-conditioned residual image network and CG data consistency."""
 
     def __init__(self, fitter: Fitter | None) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         super().__init__(fitter or 'dictionary')
         self.end_to_end = fitter is not None
         self.fit_weight = 0.0001
@@ -208,7 +209,7 @@ class PINQI(Reconstruction):
     """PINQI with shared stage-conditioned image and parameter networks."""
 
     def __init__(self, fitter: Fitter) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         super().__init__(fitter)
         self.parameter_net = mr2.nn.ComplexAsChannel(
             mr2.nn.nets.UNet(

@@ -78,7 +78,7 @@ class SaturationRecoveryDataset(torch.utils.data.Dataset[Sample]):
     """Simulated undersampled multi-coil saturation-recovery k-space from axial BrainWeb slices."""
 
     def __init__(self, folder: Path, *, train: bool, step: int = 1) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         self.folder = folder
         self.image_shape = (192, 192)
         self.acceleration = 8.0
@@ -215,7 +215,7 @@ class BrainWebData(pl.LightningDataModule):
     """Subject-disjoint loaders: 16 training subjects, s51 validation, s52-54 testing."""
 
     def __init__(self, folder: Path, batch_size: int = 8, workers: int = 4) -> None:
-        """Initialize the fixed BrainWeb experiment settings."""
+        """Initialize the reconstruction settings."""
         super().__init__()
         self.folder = folder
         self.batch_size = batch_size

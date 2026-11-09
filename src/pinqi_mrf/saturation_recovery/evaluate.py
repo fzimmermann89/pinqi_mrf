@@ -6,19 +6,20 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
-from data import SUBJECTS, BrainWebData
-from models import cg_dictionary, metrics, normalize
-from train import Experiment
+
+from pinqi_mrf.saturation_recovery.data import SUBJECTS, BrainWebData
+from pinqi_mrf.saturation_recovery.models import cg_dictionary, metrics, normalize
+from pinqi_mrf.saturation_recovery.train import Experiment
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Save per-slice brain scores and print equally weighted test-set means."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--brainweb', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True, help='Output CSV path.')
     parser.add_argument('--checkpoint', type=Path, help='Omit for the CG + dictionary baseline.')
     parser.add_argument('--workers', type=int, default=4)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     pl.seed_everything(0, workers=True)
     torch.set_float32_matmul_precision('high')
     device = torch.device('cuda')
