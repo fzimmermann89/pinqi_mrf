@@ -1,13 +1,13 @@
 """Tests for DELICS radial k-space datasets."""
 
 from pathlib import Path
-from typing import Literal
 
 import h5py
 import numpy as np
+import pytest
 import torch
 
-from pinqi_mrf.data import DelicsRadialDataModule, DelicsRadialDataset
+from pinqi_mrf.data import DELICS_CASES, DelicsRadialDataset, SupervisedDataModule
 
 
 def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray | None = None) -> None:
@@ -31,23 +31,6 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
         handle.create_dataset('reference_t2', data=reference_t2)
 
 
-def test_delics_radial_dataset_returns_training_fields_only(tmp_path: Path) -> None:
-    """Default samples contain only real-data-compatible training fields."""
-    _write_delics_radial(tmp_path / 'delics_radial_case001.h5')
-
-    dataset = DelicsRadialDataset(tmp_path, delics_noise_std=0.0)
-    sample = dataset[0]
-
-    assert set(sample) == {'case_id', 'slice_index', 'kspace', 'mask'}
-    assert sample['case_id'].item() == 0
-    assert sample['slice_index'].item() == 0
-    assert sample['kspace'].shape == (3, 4, 1, 1, 5)
-    assert sample['kspace'].dtype == torch.complex64
-    torch.testing.assert_close(sample['kspace'], torch.full((3, 4, 1, 1, 5), 1.0 + 0.0j, dtype=torch.complex64))
-    assert sample['mask'].shape == (6, 7)
-    assert len(dataset) == 1
-
-
 def test_delics_radial_dataset_noise_is_deterministic(tmp_path: Path) -> None:
     """Configured DELICS noise stays fixed for the same case and slice."""
     _write_delics_radial(tmp_path / 'delics_radial_case001.h5')
@@ -65,9 +48,7 @@ def test_delics_radial_reference_dataset_returns_reference_fields(tmp_path: Path
     """Validation samples expose reference relaxation maps explicitly."""
     _write_delics_radial(tmp_path / 'delics_radial_case001.h5')
 
-    dataset: DelicsRadialDataset[Literal[True]] = DelicsRadialDataset(
-        tmp_path, include_references=True, delics_noise_std=0.0
-    )
+    dataset = DelicsRadialDataset(tmp_path, delics_noise_std=0.0)
     sample = dataset[0]
 
     assert set(sample) == {
@@ -78,20 +59,10 @@ def test_delics_radial_reference_dataset_returns_reference_fields(tmp_path: Path
         'm0',
         't1',
         't2',
-        'csm',
-        'noise_std',
-        'reference_m0',
-        'reference_t1',
-        'reference_t2',
     }
     assert sample['m0'].shape == (6, 7)
     assert sample['t1'].shape == (6, 7)
     assert sample['t2'].shape == (6, 7)
-    assert sample['csm'].shape == (4, 1, 6, 7)
-    assert sample['noise_std'].shape == ()
-    assert sample['reference_m0'].shape == (6, 7)
-    assert sample['reference_t1'].shape == (6, 7)
-    assert sample['reference_t2'].shape == (6, 7)
 
 
 def test_delics_radial_dataset_trims_subject_slices(tmp_path: Path) -> None:
@@ -103,31 +74,42 @@ def test_delics_radial_dataset_trims_subject_slices(tmp_path: Path) -> None:
     assert [dataset[index]['slice_index'].item() for index in range(len(dataset))] == [2, 3, 4, 5, 6]
 
 
-def test_delics_radial_datamodule_filters_case_ids(tmp_path: Path) -> None:
-    """Train and validation loaders use explicit subject splits."""
-    _write_delics_radial(tmp_path / 'delics_radial_case001.h5', case_id='case001')
-    _write_delics_radial(tmp_path / 'delics_radial_case002.h5', case_id='case002')
+@pytest.mark.parametrize('held_out', DELICS_CASES)
+@pytest.mark.filterwarnings('ignore:ComplexHalf support is experimental:UserWarning')
+def test_delics_leave_one_out_split(tmp_path: Path, held_out: str) -> None:
+    """Every fold trains on nine subjects, evaluates the tenth and rejects cross-fold resume."""
+    frames = tmp_path / 'frames'
+    frames.mkdir()
+    for case in DELICS_CASES:
+        _write_delics_radial(tmp_path / f'delics_radial_{case}.h5', case_id=case)
+        with h5py.File(frames / f'{case}-t3-c4.h5', 'w') as cache:
+            group = cache.create_group('z000')
+            packed = np.zeros((3, 4, 6, 7), dtype=[('r', '<f2'), ('i', '<f2')])
+            group['frames'] = packed
+            for name in ('m0', 't1', 't2'):
+                group[name] = np.ones((6, 7), dtype=np.complex64 if name == 'm0' else np.float32)
+            group['mask'] = np.ones((6, 7), dtype=bool)
 
-    datamodule = DelicsRadialDataModule(
+    data = SupervisedDataModule(
         tmp_path,
-        train_case_ids=('case001',),
-        val_case_ids=('case002',),
+        frames,
+        held_out_case=held_out,
         batch_size=1,
         num_workers=0,
+        n_timepoints=3,
+        n_coils=4,
     )
-    datamodule.setup()
+    data.setup('fit')
+    assert data.train_dataset is not None
+    assert {case for _path, case in data.train_dataset.files} == set(DELICS_CASES) - {held_out}
+    assert data.val_dataloader() == []
+    train_batch = next(iter(data.train_dataloader()))
+    assert train_batch['frames'].shape == (1, 3, 4, 6, 7)
 
-    train_batch = next(iter(datamodule.train_dataloader()))
-    val_loader = datamodule.val_dataloader()
-    assert val_loader is not None
-    val_batch = next(iter(val_loader))
-
-    torch.testing.assert_close(train_batch['case_id'], torch.tensor([0]))
-    torch.testing.assert_close(val_batch['case_id'], torch.tensor([0]))
-    assert train_batch['kspace'].shape == (1, 3, 4, 1, 1, 5)
-    assert 'reference_t1' not in train_batch
-    assert 'reference_t2' not in train_batch
-    assert val_batch['csm'].shape == (1, 4, 1, 6, 7)
-    assert val_batch['noise_std'].shape == (1,)
-    assert val_batch['reference_t1'].shape == (1, 6, 7)
-    assert val_batch['reference_t2'].shape == (1, 6, 7)
+    data.setup('validate')
+    assert data.val_dataset is not None
+    assert {case for _path, case in data.val_dataset.files} == {held_out}
+    data.load_state_dict(data.state_dict())
+    other = next(case for case in DELICS_CASES if case != held_out)
+    with pytest.raises(ValueError, match='different DELICS fold'):
+        data.load_state_dict({'case_ids': DELICS_CASES, 'held_out_case': other})

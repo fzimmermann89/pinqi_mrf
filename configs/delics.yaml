@@ -1,94 +1,34 @@
 seed_everything: 42
 trainer:
-  default_root_dir: runs/delics
-  logger:
-    class_path: lightning.pytorch.loggers.CSVLogger
-    init_args:
-      save_dir: runs
-      name: delics
-  callbacks:
-    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-      init_args:
-        monitor: val_0/rmse_t1
-        mode: min
-        filename: best-t1-rmse
-        save_last: true
-        auto_insert_metric_name: false
-    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
-      init_args:
-        logging_interval: step
   accelerator: gpu
   devices: 1
-  num_nodes: 1
   max_epochs: 80
   precision: 32-true
-  num_sanity_val_steps: 1
   log_every_n_steps: 10
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 model:
   n_subspace_coefficients: 10
   n_readout_samples: 256
-  n_iterations: 5
-  n_features_image_net:
-  - 48
-  - 64
-  - 96
-  - 128
-  n_features_parameter_net:
-  - 64
-  - 128
-  - 192
-  - 256
+  n_iterations: 4
+  n_features_image_net: [48, 64, 96, 128]
+  n_features_parameter_net: [64, 128, 192, 256]
   nonlinear_solver_batch_size: 2048
   lr: 0.0003
   scalar_lr_multiplier: 2.0
   weight_decay: 0.001
-  loss_weights:
-  - 0.1
-  - 0.1
-  - 0.1
-  - 0.1
-  - 0.8
-  loss_l1: 0.0
-  loss_ssim: 0.3
-  ema_eval: true
+  loss_weights: [0.2, 0.1, 0.1, 0.8]
   ema_decay: 0.97
   ema_update_interval: 4
-  brainweb_delics_csms: true
-  relaxation_loss: log_l1
-  t2_loss_weight: 1.0
 data:
   folder: data/delics/radial
-  train_case_ids:
-  - case001
-  - case002
-  - case003
-  - case004
-  - case005
-  - case006
-  - case008
-  - case009
-  val_case_ids:
-  - case000
-  - case007
-  brainweb_loss_weight: 0.25
-  delics_batch_size: 6
-  brainweb_batch_size: 4
+  frame_folder: data/delics/frames
+  held_out_case: case000
+  case_ids: [case000, case001, case002, case003, case004, case005, case006, case007, case008, case009]
+  batch_size: 8
   val_batch_size: 1
   num_workers: 2
   size: 256
   n_coils: 8
-  noise:
-  - 0.0
-  - 0.05
-  frame_folder: data/delics/frames
-  frame_timepoints: 352
-  frame_coils: 8
-  frame_noise:
-  - 0.002
-  - 0.006
-  brainweb_train_folder: data/brainweb/train
-  brainweb_val_folder: data/brainweb/validation
-  brainweb_train_subjects: [s06, s18, s20, s38, s41, s42, s43, s44, s45, s46, s47, s48, s49, s50, s51, s52, s53, s54]
-  brainweb_val_subjects: [s04, s05]
+  n_timepoints: 352
+  noise: [0.002, 0.006]

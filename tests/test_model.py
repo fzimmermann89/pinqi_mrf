@@ -1,6 +1,5 @@
 """Tests for model-side operator composition helpers."""
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -8,9 +7,9 @@ import mr2
 import pytest
 import torch
 
-from pinqi_mrf.data import BatchType
-from pinqi_mrf.finetune import FineTuneModule
+from pinqi_mrf.data import ParameterBatch
 from pinqi_mrf.pinqi import PINQI, PINQIConfig
+from pinqi_mrf.supervised import SupervisedModule
 
 
 class DummyScalingSignalModel(mr2.operators.SignalModel[torch.Tensor, torch.Tensor, torch.Tensor]):
@@ -29,9 +28,9 @@ class DummyScalingSignalModel(mr2.operators.SignalModel[torch.Tensor, torch.Tens
         return (m0 * signal,)
 
 
-def create_small_finetune_module(**kwargs: object) -> FineTuneModule:
-    """Create a small fine-tuning module for checkpoint-loading tests."""
-    return FineTuneModule(
+def create_small_module(**kwargs: object) -> SupervisedModule:
+    """Create a small supervised module for model and loss checks."""
+    return SupervisedModule(
         signalmodel=DummyScalingSignalModel(),
         n_subspace_coefficients=2,
         image_size=8,
@@ -99,51 +98,10 @@ def test_csm_refinement_solver_matches_manual_expression() -> None:
     torch.testing.assert_close(actual_rhs, expected_rhs)
 
 
-def test_finetune_module_loads_pretrained_checkpoint_weights(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fine-tuning checkpoint initialization loads weights without trainer state."""
-    monkeypatch.setattr(torch, 'compile', lambda module: module)
-    source = create_small_finetune_module()
-    with torch.no_grad():
-        for index, parameter in enumerate(source.parameters()):
-            parameter.fill_(0.01 * (index + 1))
-
-    checkpoint_path = tmp_path / 'pretrain.ckpt'
-    torch.save({'state_dict': source.state_dict(), 'epoch': 17, 'global_step': 123}, checkpoint_path)
-
-    target = create_small_finetune_module(pretrained_checkpoint=checkpoint_path)
-
-    for key, expected in source.state_dict().items():
-        torch.testing.assert_close(target.state_dict()[key], expected)
-    assert target.current_epoch == 0
-    assert target.global_step == 0
-
-
-def test_finetune_module_initializes_ema_from_legacy_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Fine-tuning loads checkpoints saved before EMA weights were introduced."""
-    monkeypatch.setattr(torch, 'compile', lambda module: module)
-    source = create_small_finetune_module()
-    with torch.no_grad():
-        for parameter in source.pinqi.parameters():
-            parameter.fill_(0.25)
-    state_dict = {key: value for key, value in source.state_dict().items() if not key.startswith('pinqi_ema.')}
-    checkpoint_path = tmp_path / 'legacy_pretrain.ckpt'
-    torch.save({'state_dict': state_dict}, checkpoint_path)
-
-    target = create_small_finetune_module(pretrained_checkpoint=checkpoint_path)
-
-    for key, student_value in target.pinqi.state_dict().items():
-        torch.testing.assert_close(target.pinqi_ema.state_dict()[key], student_value)
-
-
 def test_ema_updates_after_configured_optimizer_step(monkeypatch: pytest.MonkeyPatch) -> None:
     """EMA weights incorporate the optimizer update at the configured step."""
     monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module(ema_decay=0.0, ema_update_interval=4)
+    module = create_small_module(ema_decay=0.0, ema_update_interval=4)
     parameter = next(module.pinqi.parameters())
     ema_parameter = next(module.pinqi_ema.parameters())
     with torch.no_grad():
@@ -157,35 +115,12 @@ def test_ema_updates_after_configured_optimizer_step(monkeypatch: pytest.MonkeyP
     torch.testing.assert_close(ema_parameter, parameter)
 
 
-def test_teacher_parameter_loss_uses_mask(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Teacher parameter loss ignores voxels outside the mask."""
-    monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module()
-    prediction = (
-        torch.zeros(1, 1, 1, 2, 2, dtype=torch.complex64),
-        torch.zeros(1, 1, 1, 2, 2),
-        torch.zeros(1, 1, 1, 2, 2),
-    )
-    target = (
-        torch.zeros(1, 1, 1, 2, 2, dtype=torch.complex64),
-        torch.zeros(1, 1, 1, 2, 2),
-        torch.zeros(1, 1, 1, 2, 2),
-    )
-    target[1][..., 0, 0] = 2.0
-    target[1][..., 1, 1] = 10.0
-    mask = torch.tensor([[[True, False], [False, False]]])
-
-    loss = module.teacher_parameter_loss([prediction], target, mask)
-
-    torch.testing.assert_close(loss, torch.tensor(4.0))
-
-
 def test_supervised_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Synthetic M0 supervision ignores CSM-gauge phase."""
+    """DELICS M0 supervision ignores CSM-gauge phase."""
     monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module(loss_weights=(1.0,))
+    module = create_small_module(loss_weights=(1.0,))
     batch = cast(
-        BatchType,
+        ParameterBatch,
         {
             'm0': torch.ones(1, 2, 2, dtype=torch.complex64),
             't1': torch.ones(1, 2, 2),
@@ -204,55 +139,10 @@ def test_supervised_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyP
     torch.testing.assert_close(loss, torch.tensor(0.0))
 
 
-def test_teacher_parameter_loss_uses_m0_magnitude(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Teacher M0 supervision ignores CSM-gauge phase."""
-    monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module()
-    prediction = (
-        -torch.ones(1, 1, 1, 2, 2, dtype=torch.complex64),
-        torch.zeros(1, 1, 1, 2, 2),
-        torch.zeros(1, 1, 1, 2, 2),
-    )
-    target = (
-        torch.ones(1, 1, 1, 2, 2, dtype=torch.complex64),
-        torch.zeros(1, 1, 1, 2, 2),
-        torch.zeros(1, 1, 1, 2, 2),
-    )
-    mask = torch.ones(1, 2, 2, dtype=torch.bool)
-
-    loss = module.teacher_parameter_loss([prediction], target, mask)
-
-    torch.testing.assert_close(loss, torch.tensor(0.0))
-
-
-def test_teacher_flip_augmentation_flips_components_independently(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Teacher flip augmentation mirrors components independently with conservative support."""
-    monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module(teacher_flip_probability=1.0)
-    monkeypatch.setattr(module, '_apply_teacher_intensity_augmentation', lambda targets, _mask: targets)
-    draws = iter((torch.tensor([0.0]), torch.tensor([[0.0, 1.0, 0.0, 1.0]])))
-    monkeypatch.setattr(torch, 'rand', lambda _shape, device=None: next(draws).to(device))
-    targets = (
-        torch.tensor([[[[[1 + 0j, 2 + 0j]]]]]),
-        torch.tensor([[[[[3.0, 4.0]]]]]),
-        torch.tensor([[[[[5.0, 6.0]]]]]),
-    )
-    mask = torch.tensor([[[True, False]]])
-    csm = torch.tensor([[[[[7 + 0j, 8 + 0j]]]]])
-
-    augmented_targets, augmented_mask, augmented_csm = module.augment_teacher_batch(targets, mask, csm)
-
-    torch.testing.assert_close(augmented_targets[0], torch.flip(targets[0], dims=(-1,)))
-    torch.testing.assert_close(augmented_targets[1], targets[1])
-    torch.testing.assert_close(augmented_targets[2], torch.flip(targets[2], dims=(-1,)))
-    torch.testing.assert_close(augmented_csm, csm)
-    torch.testing.assert_close(augmented_mask, mask & torch.flip(mask, dims=(-1,)))
-
-
 def test_validation_reports_primary_target_range_and_additional_plotrange_ssim(monkeypatch: pytest.MonkeyPatch) -> None:
     """Primary SSIM uses slice target limits while the extra variant uses plot limits."""
     monkeypatch.setattr(torch, 'compile', lambda module: module)
-    module = create_small_finetune_module()
+    module = create_small_module()
     target = torch.linspace(0.03, 0.08, 64).reshape(1, 1, 1, 8, 8)
     baseline = target + 0.02
     prediction = target + 0.04

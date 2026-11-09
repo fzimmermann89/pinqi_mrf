@@ -2,69 +2,15 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 import h5py
 import mr2
 import numpy as np
 import torch
 import torch.nn.functional as functional
-from scipy import ndimage
 
 from pinqi_mrf.data import DelicsRadialDataset
-
-
-@torch.no_grad()
-def walsh_coil_maps(calibration: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Estimate eight-coil fields and their measured support from a calibration-frame subset."""
-    csm = mr2.algorithms.csm.walsh(
-        calibration[:, :, None], smoothing_width=11, align_phase=True, extrapolate=True, pool_dim=0
-    ).squeeze(0)
-    rms = calibration.abs().square().mean(0).sum(0).sqrt()
-    labels, _ = ndimage.label((rms > 0.05 * torch.quantile(rms, 0.99)).cpu().numpy())
-    counts = np.bincount(labels.ravel())
-    if len(counts) < 2:
-        raise ValueError('DELICS calibration contains no connected signal support.')
-    counts[0] = 0
-    support = ndimage.binary_fill_holes(labels == counts.argmax())
-    return csm, torch.from_numpy(support).to(calibration.device)[None]
-
-
-@torch.no_grad()
-def resize_coil_maps(csms: torch.Tensor, support: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-    """Zoom complex fields to cover BrainWeb tissue, then restore unit coil RSS.
-
-    Choose the smallest centred zoom from 1 to 2 covering 99.5% of the brain mask
-    with the original calibration support. Extrapolated unit-norm CSMs alone do
-    not identify where calibration data were available.
-    """
-    height, width = masks.shape[-2:]
-    zooms = torch.linspace(1, 2, 41, device=csms.device)
-    theta = torch.zeros(len(zooms), 2, 3, device=csms.device)
-    theta[:, 0, 0] = theta[:, 1, 1] = zooms.reciprocal()
-    grid = functional.affine_grid(theta, [len(zooms), 1, height, width], align_corners=False)
-    resized = []
-    for csm, measured, mask in zip(csms, support, masks, strict=True):
-        expanded = (
-            functional.grid_sample(
-                measured[None].float().expand(len(zooms), -1, -1, -1),
-                grid,
-                padding_mode='border',
-                align_corners=False,
-            )[:, 0]
-            > 0.5
-        )
-        coverage = (expanded & mask).sum((-2, -1)) / mask.sum().clamp_min(1)
-        candidates = (coverage >= 0.995).nonzero()
-        index = int(candidates[0, 0]) if len(candidates) else len(zooms) - 1
-        n_coils = len(csm)
-        channels = torch.view_as_real(csm[:, 0]).permute(0, 3, 1, 2).reshape(1, 2 * n_coils, height, width)
-        channels = functional.grid_sample(channels, grid[index : index + 1], padding_mode='border', align_corners=False)
-        result = torch.view_as_complex(channels.reshape(n_coils, 2, height, width).permute(0, 2, 3, 1).contiguous())[
-            :, None
-        ]
-        resized.append(result / result.norm(dim=0, keepdim=True).clamp_min(1e-12))
-    return torch.stack(resized)
 
 
 class DelicsFrameBatch(TypedDict):
@@ -85,7 +31,7 @@ class DelicsFrameDataset(torch.utils.data.Dataset[DelicsFrameBatch]):
 
     def __init__(
         self,
-        reference: DelicsRadialDataset[Literal[True]],
+        reference: DelicsRadialDataset,
         folder: Path,
         n_timepoints: int = 352,
         n_coils: int = 8,
@@ -238,7 +184,7 @@ class DelicsFramePreparation:
         gram = nufft.toeplitz()
         self.kernel = cast(torch.Tensor, gram._kernel).squeeze()
         self.omega = nufft._omega.contiguous()
-        self.plans: dict[tuple[str, int, int], Any] = {}
+        self.plans: dict[tuple[int, int], Any] = {}
 
     def close(self) -> None:
         """Destroy native plans while the CUDA context is still active."""
@@ -251,8 +197,6 @@ class DelicsFramePreparation:
         self,
         standard_deviation: torch.Tensor,
         n_coils: int,
-        *,
-        source: Literal['delics', 'brainweb'] = 'delics',
     ) -> torch.Tensor:
         """Project exact white k-space noise through a reusable type-one NUFFT plan."""
         import cufinufft
@@ -262,7 +206,7 @@ class DelicsFramePreparation:
         batch_size = len(standard_deviation)
         n_transforms = batch_size * n_coils
         stream = torch.cuda.current_stream(self.basis.device)
-        key = (source, n_transforms, stream.cuda_stream)
+        key = (n_transforms, stream.cuda_stream)
         if key not in self.plans:
             self.plans[key] = cufinufft.Plan(
                 1,
