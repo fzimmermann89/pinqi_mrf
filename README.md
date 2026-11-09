@@ -2,4 +2,4 @@
 
 PINQI for magnetic resonance fingerprinting experiments.
 
-Supervised DELICS experiments: [setup and training](experiments/delics/README.md).
+Supervised DELICS experiments: [setup and training](docs/delics.md).

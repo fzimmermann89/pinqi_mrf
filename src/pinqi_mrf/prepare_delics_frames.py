@@ -35,7 +35,7 @@ def save_slice(
         'frames',
         shape=shape,
         dtype=dtype,
-        chunks=(8, *shape[1:]),
+        chunks=(min(8, len(frames)), *shape[1:]),
         compression='lzf',
         shuffle=True,
     )
@@ -66,7 +66,6 @@ def prepare_case(
     n_timepoints: int,
     n_coils: int,
     device: torch.device,
-    slice_indices: list[int] | None = None,
 ) -> None:
     """Compress each valid slice using only the retained frames and keep the matrix.
 
@@ -82,8 +81,6 @@ def prepare_case(
         Number of compressed output coils.
     device
         Device used for PCA coil compression.
-    slice_indices
-        Optional slice selection for a bounded preparation check. Training requires all valid slices.
     """
     output.mkdir(parents=True, exist_ok=True)
     with h5py.File(reference_path, 'r') as reference:
@@ -91,13 +88,15 @@ def prepare_case(
         source_path = Path(str(reference.attrs['source_file']))
         signal_scale = float(reference.attrs['kspace_scale'])
         valid = reference['valid'][()].astype(bool)
-        selected = [index for index in range(len(valid)) if valid[index]] if slice_indices is None else slice_indices
-        if any(index < 0 or index >= len(valid) or not valid[index] for index in selected):
-            raise ValueError('Selected slices must be valid reference slices.')
+        selected = [index for index in range(len(valid)) if valid[index]]
         destination = output / f'{case}-t{n_timepoints}-c{n_coils}.h5'
         if destination.exists():
             with h5py.File(destination, 'r') as cached:
                 for index in selected:
+                    if f'z{index:03d}' not in cached:
+                        raise ValueError(
+                            f'Existing cache is incomplete: {destination}; rebuild it in a new output folder.'
+                        )
                     group = cached[f'z{index:03d}']
                     if (group.attrs['signal_scale'], group.attrs['source_file']) != (signal_scale, str(source_path)):
                         raise ValueError(f'Existing cache has incompatible provenance: {destination}')
@@ -138,7 +137,6 @@ def main() -> None:
     parser.add_argument('--n-timepoints', type=int, default=352)
     parser.add_argument('--n-coils', type=int, default=8)
     parser.add_argument('--device', default='cpu')
-    parser.add_argument('--slice-indices', nargs='+', type=int)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(4)
@@ -150,7 +148,6 @@ def main() -> None:
                 n_timepoints=arguments.n_timepoints,
                 n_coils=arguments.n_coils,
                 device=torch.device(arguments.device),
-                slice_indices=arguments.slice_indices,
             )
 
 

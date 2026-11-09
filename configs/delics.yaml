@@ -27,7 +27,6 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 model:
-  initial_checkpoint: null
   n_subspace_coefficients: 10
   n_readout_samples: 256
   n_iterations: 5
@@ -91,3 +90,5 @@ data:
   - 0.006
   brainweb_train_folder: data/brainweb/train
   brainweb_val_folder: data/brainweb/validation
+  brainweb_train_subjects: [s06, s18, s20, s38, s41, s42, s43, s44, s45, s46, s47, s48, s49, s50, s51, s52, s53, s54]
+  brainweb_val_subjects: [s04, s05]

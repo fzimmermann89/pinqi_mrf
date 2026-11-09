@@ -2,22 +2,17 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TypedDict, cast
 
 import h5py
 import mr2
 import numpy as np
 import torch
+import torch._functorch.config
+from lightning.pytorch.cli import LightningArgumentParser, LightningCLI
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
-from pinqi_mrf.data import (
-    BatchType,
-    BrainwebDataset,
-    DataModule,
-    DelicsRadialDataset,
-    DelicsRadialReferenceBatch,
-    ValidationLoaderType,
-)
+from pinqi_mrf.data import BatchType, BrainwebDataset, DataModule, DelicsRadialReferenceBatch, ValidationLoaderType
 from pinqi_mrf.delics_frames import (
     DelicsFrameBatch,
     DelicsFrameDataset,
@@ -31,7 +26,7 @@ from pinqi_mrf.train import BaseModule
 class SupervisedBatch(TypedDict, total=False):
     """Independent supervised batches combined in one optimizer update."""
 
-    delics: DelicsRadialReferenceBatch | DelicsFrameBatch | BatchType
+    delics: DelicsFrameBatch | BatchType
     delics_rhs: torch.Tensor
     synthetic: BatchType
     synthetic_rhs: torch.Tensor
@@ -44,10 +39,9 @@ class SupervisedModule(BaseModule):
         self,
         brainweb_loss_weight: float = 0.0,
         brainweb_delics_csms: bool = False,
-        initial_checkpoint: Path | None = None,
         **kwargs: object,
     ) -> None:
-        """Initialize supervised training, optionally loading model and EMA weights.
+        """Initialize supervised training.
 
         Parameters
         ----------
@@ -55,8 +49,6 @@ class SupervisedModule(BaseModule):
             Weight of the additional synthetic supervised loss.
         brainweb_delics_csms
             Generate BrainWeb coils from central training-DELICS calibration slices.
-        initial_checkpoint
-            Checkpoint supplying weights without restoring optimizer or scheduler state.
         **kwargs
             Arguments forwarded to the shared reconstruction module.
         """
@@ -67,15 +59,10 @@ class SupervisedModule(BaseModule):
             {
                 'brainweb_loss_weight': brainweb_loss_weight,
                 'brainweb_delics_csms': brainweb_delics_csms,
-                'initial_checkpoint': initial_checkpoint,
             }
         )
         self._frame_preparation: DelicsFramePreparation | None = None
         self._brainweb_coils: tuple[torch.Tensor, torch.Tensor] | None = None
-        if initial_checkpoint is not None:
-            checkpoint = torch.load(initial_checkpoint, map_location='cpu', weights_only=False)
-            self.on_load_checkpoint(checkpoint)
-            self.load_state_dict(checkpoint['state_dict'])
 
     def on_fit_start(self) -> None:
         """Initialize physics and one small CSM pool using training subjects only."""
@@ -136,25 +123,17 @@ class SupervisedModule(BaseModule):
         basis = self.signalmodel.pca.compression_matrix.mH
         if basis.ndim > 2:
             basis = basis.squeeze(tuple(range(basis.ndim - 2)))
-        nufft = (
-            self._frame_preparation.nufft
-            if self._frame_preparation is not None
-            else mr2.operators.NonUniformFastFourierOp(
+        if self._frame_preparation is None:
+            if self.hparams.use_density_compensation:
+                raise ValueError('Full-frame preparation requires use_density_compensation=False.')
+            nufft = mr2.operators.NonUniformFastFourierOp(
                 direction=(-2, -1),
                 recon_matrix=self.matrix_size,
                 encoding_matrix=self.matrix_size,
                 traj=acquisition.trajectory.to(self.device),
             )
-        )
-        if 'frames' in sample:
-            if self.hparams.use_density_compensation:
-                raise ValueError('Full-frame preparation currently requires use_density_compensation=False.')
-            if self._frame_preparation is None:
-                self._frame_preparation = DelicsFramePreparation(nufft, basis)
-            rhs, targets = self._frame_preparation(sample)
-        else:
-            rhs = self.build_coil_rhs(sample['kspace'], acquisition, basis, nufft, coilwise=False)
-            targets = {key: sample[key] for key in ('m0', 't1', 't2', 'mask', 'noise_std')}
+            self._frame_preparation = DelicsFramePreparation(nufft, basis)
+        rhs, targets = self._frame_preparation(sample)
         targets['csm'] = self.estimate_initial_csm(rhs)
         # Neither the returned batch nor the preparation object keeps source frames.
         batch['delics'] = targets
@@ -262,11 +241,33 @@ class SupervisedDataModule(DataModule):
     def __init__(
         self,
         folder: Path,
+        frame_folder: Path,
         train_case_ids: Sequence[str],
         val_case_ids: Sequence[str],
         brainweb_loss_weight: float = 0.0,
         brainweb_train_folder: Path | None = None,
         brainweb_val_folder: Path | None = None,
+        brainweb_train_subjects: Sequence[str] = (
+            's06',
+            's18',
+            's20',
+            's38',
+            's41',
+            's42',
+            's43',
+            's44',
+            's45',
+            's46',
+            's47',
+            's48',
+            's49',
+            's50',
+            's51',
+            's52',
+            's53',
+            's54',
+        ),
+        brainweb_val_subjects: Sequence[str] = ('s04', 's05'),
         delics_batch_size: int = 1,
         brainweb_batch_size: int = 1,
         val_batch_size: int = 1,
@@ -274,12 +275,11 @@ class SupervisedDataModule(DataModule):
         size: int = 256,
         n_coils: int = 12,
         noise: tuple[float, float] = (0.0, 0.05),
-        frame_folder: Path | None = None,
         frame_timepoints: int = 352,
         frame_coils: int = 8,
         frame_noise: tuple[float, float] = (0.002, 0.006),
     ) -> None:
-        """Require explicit partitions and optionally enable augmented full-frame training.
+        """Require explicit partitions and augmented full-frame training.
 
         Parameters
         ----------
@@ -295,6 +295,10 @@ class SupervisedDataModule(DataModule):
             Folder containing the BrainWeb training subjects.
         brainweb_val_folder
             Folder containing disjoint BrainWeb validation subjects.
+        brainweb_train_subjects
+            Explicit subjects required in the BrainWeb training folder.
+        brainweb_val_subjects
+            Explicit subjects required in the BrainWeb validation folder.
         delics_batch_size
             Number of DELICS slices per optimizer update.
         brainweb_batch_size
@@ -310,7 +314,7 @@ class SupervisedDataModule(DataModule):
         noise
             BrainWeb noise-strength range.
         frame_folder
-            Prepared coil-frame cache; ``None`` retains the existing radial training path.
+            Prepared coil-frame cache supplying augmented training inputs.
             Validation always uses the fixed radial cache in ``folder``.
         frame_timepoints
             Retained temporal prefix; must equal the model's number of time points.
@@ -347,13 +351,15 @@ class SupervisedDataModule(DataModule):
         self.brainweb_loss_weight = brainweb_loss_weight
         self.brainweb_train_folder = brainweb_train_folder
         self.brainweb_val_folder = brainweb_val_folder
+        self.brainweb_train_subjects = tuple(brainweb_train_subjects)
+        self.brainweb_val_subjects = tuple(brainweb_val_subjects)
         self.delics_batch_size = delics_batch_size
         self.brainweb_batch_size = brainweb_batch_size
         self.frame_folder = frame_folder
         self.frame_timepoints = frame_timepoints
         self.frame_coils = frame_coils
         self.frame_noise = frame_noise
-        self.delics_train_dataset: DelicsRadialDataset[Literal[True]] | DelicsFrameDataset | None = None
+        self.delics_train_dataset: DelicsFrameDataset | None = None
         self.brainweb_train_dataset: BrainwebDataset | None = None
         self.brainweb_validation: BrainwebDataset | None = None
 
@@ -370,30 +376,27 @@ class SupervisedDataModule(DataModule):
         _ = stage
         if self.delics_train_dataset is not None:
             return
-        self.delics_train_dataset = self.build_delics_dataset(
-            case_ids=self.train_case_ids, slice_trim=(0, 0), include_references=True
-        )
+        reference = self.build_delics_dataset(case_ids=self.train_case_ids, slice_trim=(0, 0), include_references=True)
         self.delics_val_dataset = self.build_delics_dataset(
             case_ids=self.delics_val_case_ids, slice_trim=(0, 0), include_references=True
         )
-        train_files = {p.resolve() for p, _case in self.delics_train_dataset.files}
+        train_files = {p.resolve() for p, _case in reference.files}
         val_files = {p.resolve() for p, _case in self.delics_val_dataset.files}
         if train_files & val_files:
             raise ValueError('DELICS partitions resolve to shared files.')
         for dataset, requested in [
-            (self.delics_train_dataset, self.train_case_ids),
+            (reference, self.train_case_ids),
             (self.delics_val_dataset, self.delics_val_case_ids),
         ]:
             if {case for _path, case in dataset.files} != set(requested):
                 raise ValueError('A requested DELICS case is missing from the cache.')
-        if self.frame_folder is not None:
-            self.delics_train_dataset = DelicsFrameDataset(
-                self.delics_train_dataset,
-                self.frame_folder,
-                n_timepoints=self.frame_timepoints,
-                n_coils=self.frame_coils,
-                noise=self.frame_noise,
-            )
+        self.delics_train_dataset = DelicsFrameDataset(
+            reference,
+            self.frame_folder,
+            n_timepoints=self.frame_timepoints,
+            n_coils=self.frame_coils,
+            noise=self.frame_noise,
+        )
         if self.brainweb_loss_weight:
             if self.brainweb_train_folder is None or self.brainweb_val_folder is None:
                 raise RuntimeError('Missing BrainWeb partitions.')
@@ -401,6 +404,10 @@ class SupervisedDataModule(DataModule):
             val = {p.resolve() for p in self.brainweb_val_folder.glob('s??.h5')}
             if not train or not val or train & val or {p.name for p in train} & {p.name for p in val}:
                 raise ValueError('BrainWeb subjects must be nonempty and disjoint.')
+            if {p.stem for p in train} != set(self.brainweb_train_subjects):
+                raise ValueError('BrainWeb training folder does not match the configured subjects.')
+            if {p.stem for p in val} != set(self.brainweb_val_subjects):
+                raise ValueError('BrainWeb validation folder does not match the configured subjects.')
             self.brainweb_train_dataset = self.build_brainweb_dataset(
                 orientation=('axial', 'coronal', 'sagittal'), random=True
             )
@@ -494,3 +501,34 @@ class SupervisedDataModule(DataModule):
                 )
             )
         return loaders
+
+
+class DelicsCLI(LightningCLI):
+    """Keep shared acquisition dimensions and mixture weights consistent."""
+
+    def add_arguments_to_parser(self, parser: LightningArgumentParser) -> None:
+        """Link data settings to reconstruction settings."""
+        for source, target in [
+            ('brainweb_loss_weight', 'brainweb_loss_weight'),
+            ('size', 'image_size'),
+            ('n_coils', 'n_coils'),
+            ('frame_coils', 'n_compressed_coils'),
+            ('frame_timepoints', 'n_timepoints'),
+        ]:
+            parser.link_arguments(f'data.{source}', f'model.{target}', apply_on='instantiate')
+
+
+def main() -> None:
+    """Run Lightning's fit or validate command, including checkpoint resume."""
+    torch.set_float32_matmul_precision('high')
+    torch._functorch.config.activation_memory_budget = 0.7
+    DelicsCLI(
+        SupervisedModule,
+        SupervisedDataModule,
+        seed_everything_default=42,
+        save_config_kwargs={'overwrite': True},
+    )
+
+
+if __name__ == '__main__':
+    main()

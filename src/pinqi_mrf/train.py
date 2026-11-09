@@ -498,23 +498,16 @@ class BaseModule(pl.LightningModule):
         predictions: ParameterTuple,
         targets: ParameterTuple,
         mask: torch.Tensor,
-        m0_scale: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """Compute masked per-parameter losses.
 
         The first parameter is complex M0. Its phase is gauge dependent, so compare magnitudes only.
-        An optional reference RMS scale gives a relative M0 loss averaged equally across slices.
         """
         losses: list[torch.Tensor] = []
         for parameter_index, (prediction, target) in enumerate(zip(predictions, targets, strict=True)):
             target_is_complex = torch.is_complex(target)
             if parameter_index == 0 and target_is_complex:
-                if m0_scale is None:
-                    losses.append(torch.nn.functional.mse_loss(prediction[mask].abs(), target[mask].abs()))
-                else:
-                    difference = torch.where(mask, (prediction.abs() - target.abs()) / m0_scale, 0.0)
-                    count = mask.flatten(1).sum(1).clamp_min(1)
-                    losses.append((difference.square().flatten(1).sum(1) / count).mean())
+                losses.append(torch.nn.functional.mse_loss(prediction[mask].abs(), target[mask].abs()))
             elif target_is_complex:
                 losses.append(
                     torch.nn.functional.mse_loss(torch.view_as_real(prediction[mask]), torch.view_as_real(target[mask]))
@@ -660,9 +653,6 @@ class BaseModule(pl.LightningModule):
         if clip_to_target_range:
             metric_prediction_map = prediction_map.clamp(min=target_min, max=target_max)
             metric_baseline_map = baseline_map.clamp(min=target_min, max=target_max)
-        target_masked = target_map[metric_mask]
-        baseline_masked = metric_baseline_map[metric_mask]
-        prediction_masked = metric_prediction_map[metric_mask]
         metric_mask_ssim = metric_mask[:, None]
         target_plot_range = torch.where(metric_mask_ssim, target_map.clamp(*display_range)[:, None], 0.0)
         baseline_plot_range = torch.where(metric_mask_ssim, metric_baseline_map.clamp(*display_range)[:, None], 0.0)
@@ -700,8 +690,8 @@ class BaseModule(pl.LightningModule):
             target=target,
             baseline=baseline,
             prediction=prediction,
-            rmse=torch.sqrt(torch.nn.functional.mse_loss(prediction_masked, target_masked)),
-            baseline_rmse=torch.sqrt(torch.nn.functional.mse_loss(baseline_masked, target_masked)),
+            rmse=(difference.square().sum(1) / counts).sqrt().mean(),
+            baseline_rmse=(baseline_difference.square().sum(1) / counts).sqrt().mean(),
             ssim=ssim,
             baseline_ssim=baseline_ssim,
             ssim_plotrange=ssim_plotrange,
@@ -846,6 +836,8 @@ class BaseModule(pl.LightningModule):
         prediction_m0: torch.Tensor,
     ) -> None:
         """Append one selected validation batch for epoch-end figure logging."""
+        if not any(isinstance(logger, WandbLogger) for logger in self.loggers):
+            return
         target_m0 = target_m0.detach().cpu()
         display_mask = torch.stack([self._head_mask(sample) for sample in target_m0]).reshape(mask.shape)
         self.validation_step_outputs.setdefault(loader_id, []).append(
