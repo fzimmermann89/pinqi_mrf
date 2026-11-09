@@ -6,7 +6,6 @@ Example: python train.py pinqi-dictionary --brainweb /path/to/brainweb --output 
 import argparse
 import json
 from pathlib import Path
-from typing import Literal
 
 import lightning.pytorch as pl
 import torch
@@ -14,7 +13,7 @@ from data import BrainWebData, Sample
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, Logger, WandbLogger
 from lightning.pytorch.utilities.types import OptimizerLRSchedulerConfig
-from models import PINQI, T1_BOUNDS, MoDL, masked_ssim, metrics, normalize
+from models import PINQI, T1_BOUNDS, Fitter, MoDL, masked_ssim, metrics, normalize
 
 METHODS = ('modl', 'modl-dictionary', 'modl-lbfgs', 'pinqi-dictionary', 'pinqi-lbfgs')
 
@@ -30,7 +29,7 @@ class Experiment(pl.LightningModule):
         self.save_hyperparameters()
         self.method = method
         self.learning_rate = learning_rate if learning_rate is not None else (8e-4 if method == 'modl' else 4e-4)
-        fitter: Literal['dictionary', 'lbfgs'] | None = (
+        fitter: Fitter | None = (
             'dictionary' if method.endswith('-dictionary') else 'lbfgs' if method.endswith('-lbfgs') else None
         )
         if method.startswith('pinqi'):

@@ -252,7 +252,7 @@ class BrainWebData(pl.LightningDataModule):
             collate_fn=collate,
             pin_memory=True,
             multiprocessing_context='spawn' if self.workers else None,
-            persistent_workers=train and self.workers > 0,
+            persistent_workers=self.workers > 0,
         )
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:

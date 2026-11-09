@@ -45,7 +45,7 @@ def main() -> None:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    for name in ('t1_mae_s', 't1_rmse_s', 't1_nrmse', 't1_ssim', 'm0_nrmse'):
+    for name in scores:
         mean = torch.tensor([row[name] for row in rows]).nanmean()
         print(f'{name}: {mean:.6f}')  # noqa: T201
 

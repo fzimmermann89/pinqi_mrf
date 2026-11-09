@@ -89,7 +89,7 @@ def masked_ssim(prediction: torch.Tensor, target: torch.Tensor, brain: torch.Ten
 
 
 def metrics(m0: torch.Tensor, t1: torch.Tensor, sample: Sample) -> dict[str, torch.Tensor]:
-    """Return per-slice brain T1 nRMSE, MAE (s), SSIM, and complex ``m0`` nRMSE."""
+    """Return per-slice brain T1 nRMSE, MAE and RMSE (s), SSIM, and complex ``m0`` nRMSE."""
     brain = sample['brain']
     target_t1 = torch.where(brain, sample['t1'], 0).flatten(1)
     target_m0 = torch.where(brain, sample['m0'], 0).flatten(1)
@@ -116,12 +116,12 @@ def normalize(batch: Sample) -> Sample:
 
 
 class Reconstruction(torch.nn.Module):
-    """Shared normalization, image prior and signal model of the two reconstructions."""
+    """Shared image prior, stage conditioning and signal model of the two reconstructions."""
 
     t1_coordinates: torch.Tensor
-    fit: DictionaryFit | OptimizerFit | None
+    fit: DictionaryFit | OptimizerFit
 
-    def __init__(self, fitter: Fitter | None) -> None:
+    def __init__(self, fitter: Fitter) -> None:
         """Initialize the fixed BrainWeb experiment settings."""
         super().__init__()
         self.cg_iterations = 20
@@ -146,10 +146,8 @@ class Reconstruction(torch.nn.Module):
         self.register_buffer('t1_coordinates', self.constraints.inverse(torch.tensor(1.0), t1)[1])
         if fitter == 'dictionary':
             self.fit = DictionaryFit(self.signal_model, self.t1_coordinates)
-        elif fitter == 'lbfgs':
-            self.fit = OptimizerFit(self.signal_model, 20)
         else:
-            self.fit = None
+            self.fit = OptimizerFit(self.signal_model, 20)
 
     def condition(self, stage: int) -> torch.Tensor:
         """Return the learned embedding of a stage; stage 0 is the initial parameter prediction."""
@@ -197,7 +195,6 @@ class MoDL(Reconstruction):
         """Match the final images against the fixed weak zero-M0/reference-T1 prior."""
         m0 = images.new_zeros(images.shape[1:])
         coordinate = images.real.new_full(images.shape[1:], self.t1_reference_coordinate)
-        assert self.fit is not None
         m0, coordinate = self.fit(images, m0, coordinate, images.real.new_tensor(self.fit_weight))
         return m0, self.constraints(m0, coordinate)[1]
 
@@ -237,7 +234,6 @@ class PINQI(Reconstruction):
 
     def forward(self, sample: Sample) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Reconstruct a prepared batch."""
-        assert self.fit is not None
         acquisition = acquisition_op(sample['ky'], sample['csm'])
         gram = acquisition.gram
         (adjoint,) = acquisition.H(sample['data'])
