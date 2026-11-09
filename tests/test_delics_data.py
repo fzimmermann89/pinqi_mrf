@@ -76,7 +76,7 @@ def test_delics_radial_dataset_trims_subject_slices(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize('held_out', DELICS_CASES)
 @pytest.mark.filterwarnings('ignore:ComplexHalf support is experimental:UserWarning')
-def test_delics_leave_one_out_split(tmp_path: Path, held_out: str) -> None:
+def test_delics_leave_one_out_split(tmp_path: Path, held_out: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every fold trains on nine subjects, evaluates the tenth and rejects cross-fold resume."""
     frames = tmp_path / 'frames'
     frames.mkdir()
@@ -99,7 +99,15 @@ def test_delics_leave_one_out_split(tmp_path: Path, held_out: str) -> None:
         n_timepoints=3,
         n_coils=4,
     )
-    data.setup('fit')
+    original_file = h5py.File
+
+    def training_file(path: Path, *args: object, **kwargs: object) -> h5py.File:
+        assert Path(path).name != f'delics_radial_{held_out}.h5'
+        return original_file(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(h5py, 'File', training_file)
+        data.setup('fit')
     assert data.train_dataset is not None
     assert {case for _path, case in data.train_dataset.files} == set(DELICS_CASES) - {held_out}
     assert data.val_dataloader() == []

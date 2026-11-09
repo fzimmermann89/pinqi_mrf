@@ -60,10 +60,12 @@ class DelicsRadialDataset(torch.utils.data.Dataset[DelicsRadialBatch]):
         self.samples: list[tuple[int, int]] = []
 
         for path in sorted(folder.glob(case_glob)):
+            case_id = path.stem.removeprefix('delics_radial_')
+            if allowed_case_ids is not None and case_id not in allowed_case_ids:
+                continue
             with h5py.File(path, 'r') as handle:
-                case_id = str(handle.attrs.get('case', path.stem.removeprefix('delics_radial_')))
-                if allowed_case_ids is not None and case_id not in allowed_case_ids:
-                    continue
+                if str(handle.attrs.get('case', case_id)) != case_id:
+                    raise ValueError(f'DELICS subject attribute does not match its filename: {path}')
                 file_index = len(self.files)
                 self.files.append((path, case_id))
                 valid = handle['valid'][()].astype(bool)
