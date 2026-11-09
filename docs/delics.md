@@ -40,4 +40,4 @@ Validation reports per-slice-weighted MAE/RMSE/NRMSE, SSIM and HFEN for T1/T2 an
 
 ## Dependencies and memory
 
-The compiled U-Nets use PyTorch's activation recomputation budget of 0.7. Batch eight needs a large GPU; reduce `--data.batch_size` for smaller devices. MR2 is declared as the `mrtwo` distribution and imported as `mr2`. The checked research checkout includes unpublished spherical-harmonic phantom helpers and optimizer changes. Publish and pin those MR2 changes before expecting a reproducible installation from released packages.
+The compiled U-Nets use PyTorch's activation recomputation budget of 0.7. Batch eight needs a large GPU; reduce `--data.batch_size` for smaller devices. MR2 is declared as the `mrtwo` distribution and imported as `mr2`. Version 0.261029 or newer is required for the spherical-harmonic phantom helpers. The full recipe has been checked against the local MR2 research checkout; numerical equivalence with a clean released installation has not yet been verified.
