@@ -203,3 +203,6 @@ cython_debug/
 
 # debug
 debug/
+
+# Experiment outputs
+runs/

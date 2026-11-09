@@ -9,11 +9,13 @@ description = "PINQI experiments for magnetic resonance fingerprinting."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
+    "cmap>=0.6",
     "einops>=0.7.0",
+    "jsonargparse[signatures]>=4.27",
     "h5py>=3.10",
     "lightning>=2.4",
     "matplotlib>=3.8",
-    "mrtwo",
+    "mrtwo>=0.261029",
     "numpy>=1.23,<3.0",
     "scipy>=1.15",
     "torch>=2.3.1",

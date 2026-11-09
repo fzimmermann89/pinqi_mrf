@@ -344,7 +344,9 @@ class PINQI(torch.nn.Module):
             else:
                 lambda_image = torch.zeros_like(lambda_image)
                 image_reg = images[-1]
-            images.extend(linear_solver(lambda_image, lambda_q, image_reg, signal, rhs))
+            images.extend(
+                linear_solver(lambda_image, lambda_q, image_reg, signal, rhs, initial_value=(images[-1].detach(),))
+            )
             if len(lambda_parameters) != self.config.n_parameter_priors:
                 raise RuntimeError('Number of parameter prior weights must match the parameter prior tuple.')
             parameter_reg = self.get_parameter_reg(images[-1], iteration) if self.use_parameter_net else None
