@@ -4,6 +4,7 @@ import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Generic, Literal, NotRequired, TypedDict, TypeVar, overload
 
@@ -11,22 +12,23 @@ import h5py
 import lightning.pytorch as pl
 import mr2
 import torch
+import torchvision.transforms.functional
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
 BrainwebTissueName = Literal['skl', 'gry', 'wht', 'csf', 'mrw', 'dura', 'fat', 'fat2', 'mus', 'm-s', 'ves']
 
 BRAINWEB_VALUES_3T_RANDOMIZED: Mapping[BrainwebTissueName, mr2.phantoms.brainweb.BrainwebTissue] = {
-    'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.05), (-0.2, 0.2)),
-    'gry': mr2.phantoms.brainweb.BrainwebTissue((1.200, 2.000), (0.080, 0.120), (0.70, 1.00), (-0.2, 0.2)),
-    'wht': mr2.phantoms.brainweb.BrainwebTissue((0.800, 1.500), (0.060, 0.100), (0.50, 0.90), (-0.2, 0.2)),
-    'csf': mr2.phantoms.brainweb.BrainwebTissue((2.000, 4.000), (1.300, 2.000), (0.90, 1.00), (-0.2, 0.2)),
-    'mrw': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.70, 1.00), (-0.2, 0.2)),
-    'dura': mr2.phantoms.brainweb.BrainwebTissue((2.000, 2.800), (0.200, 0.500), (0.90, 1.00), (-0.2, 0.2)),
-    'fat': mr2.phantoms.brainweb.BrainwebTissue((0.300, 0.500), (0.060, 0.100), (0.90, 1.00), (-0.2, 0.2)),
-    'fat2': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.60, 0.90), (-0.2, 0.2)),
-    'mus': mr2.phantoms.brainweb.BrainwebTissue((1.200, 1.500), (0.040, 0.060), (0.90, 1.00), (-0.2, 0.2)),
-    'm-s': mr2.phantoms.brainweb.BrainwebTissue((0.500, 0.900), (0.300, 0.500), (0.90, 1.00), (-0.2, 0.2)),
-    'ves': mr2.phantoms.brainweb.BrainwebTissue((1.700, 2.100), (0.200, 0.400), (0.80, 1.00), (-0.2, 0.2)),
+    'skl': mr2.phantoms.brainweb.BrainwebTissue((0.000, 2.000), (0.020, 0.030), (0.00, 0.15), (-0.2, 0.2)),
+    'gry': mr2.phantoms.brainweb.BrainwebTissue((0.700, 2.000), (0.025, 0.120), (0.60, 1.10), (-0.2, 0.2)),
+    'wht': mr2.phantoms.brainweb.BrainwebTissue((0.550, 1.500), (0.020, 0.100), (0.40, 1.00), (-0.2, 0.2)),
+    'csf': mr2.phantoms.brainweb.BrainwebTissue((1.400, 3.000), (0.100, 1.500), (0.20, 1.10), (-0.2, 0.2)),
+    'mrw': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.60, 1.10), (-0.2, 0.2)),
+    'dura': mr2.phantoms.brainweb.BrainwebTissue((2.000, 2.800), (0.200, 0.500), (0.80, 1.10), (-0.2, 0.2)),
+    'fat': mr2.phantoms.brainweb.BrainwebTissue((0.300, 0.500), (0.060, 0.100), (0.80, 1.10), (-0.2, 0.2)),
+    'fat2': mr2.phantoms.brainweb.BrainwebTissue((0.400, 0.600), (0.060, 0.100), (0.50, 1.00), (-0.2, 0.2)),
+    'mus': mr2.phantoms.brainweb.BrainwebTissue((1.200, 1.500), (0.040, 0.060), (0.80, 1.10), (-0.2, 0.2)),
+    'm-s': mr2.phantoms.brainweb.BrainwebTissue((0.500, 0.900), (0.300, 0.500), (0.80, 1.10), (-0.2, 0.2)),
+    'ves': mr2.phantoms.brainweb.BrainwebTissue((1.700, 2.100), (0.200, 0.400), (0.70, 1.10), (-0.2, 0.2)),
 }
 
 
@@ -50,9 +52,12 @@ class DelicsRadialBatch(TypedDict):
     mask: torch.Tensor
 
 
-class DelicsRadialReferenceBatch(DelicsRadialBatch, BatchType):
+class DelicsRadialReferenceBatch(BatchType):
     """Type hint for one DELICS validation sample with reference maps."""
 
+    case_id: torch.Tensor
+    slice_index: torch.Tensor
+    kspace: torch.Tensor
     reference_m0: torch.Tensor
     reference_t1: torch.Tensor
     reference_t2: torch.Tensor
@@ -279,6 +284,105 @@ class DelicsRadialDataModule(pl.LightningDataModule):
         )
 
 
+def prepare_brainweb_slice(
+    data: torch.Tensor,
+    generator: torch.Generator | None = None,
+    *,
+    size: int,
+    random: bool,
+) -> torch.Tensor:
+    """Apply MR2's affine recipe with scale 0.70-1.00 and fixed front/back orientation.
+
+    MR2's augmentation accepts only symmetric scale jitter. This uses its same trim,
+    affine interpolation and crop operations with an asymmetric scale draw instead.
+    Validation disables geometric jitter and horizontal flips.
+    """
+    draws = torch.empty(6).uniform_(-1, 1, generator=generator).tolist()
+    scale = size / max(data.shape[-2:])
+    if random:
+        scale *= 0.85 + 0.15 * draws[3]
+    data = data[(slice(None), *mr2.phantoms.brainweb.trim_indices(data.sum(0) > 0.1 * data.amax()))]
+    data = torchvision.transforms.functional.affine(
+        data,
+        angle=10 * draws[2] if random else 0,
+        scale=scale,
+        shear=[5 * draws[0], 5 * draws[1]] if random else [0, 0],
+        translate=draws[4:6],
+        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+        fill=0.0,
+    )
+    if random and torch.rand((), generator=generator) < 0.5:
+        data = torchvision.transforms.functional.hflip(data)
+    data = torchvision.transforms.functional.vflip(data)
+    return torchvision.transforms.functional.center_crop(data, [size, size])
+
+
+def spatial_parameter_multiplier(
+    mask: torch.Tensor,
+    smooth_fraction: float | tuple[float, float],
+    noise_fraction: float,
+    generator: torch.Generator,
+    *,
+    degree_two_scale: float = 1.0,
+    radial_fraction: float | tuple[float, float] = 0.0,
+) -> torch.Tensor:
+    """Return bounded smooth and multiscale magnitude variation, unchanged outside tissue.
+
+    The degree-four field follows the MRpro PINQI recipe. Three bicubic Gaussian grids add finer
+    variation at approximately 20, 10 and 6 pixels, following its later multiscale recipe.
+    Independent calls give independent fields for M0 magnitude, T1 and T2. Degree-two
+    coefficients can be amplified before normalizing the combined harmonic field. An optional
+    elliptical quadratic field brightens the tissue periphery by a uniform draw from
+    ``radial_fraction`` (a scalar means zero to that value); its centre and radii follow
+    the tissue bounding box.
+    """
+    foreground = mask.squeeze()
+    multiplier = torch.ones_like(foreground, dtype=torch.float32)
+    if not foreground.any():
+        return multiplier.reshape_as(mask)
+    smooth_min, smooth_max = smooth_fraction if isinstance(smooth_fraction, tuple) else (0.0, smooth_fraction)
+    if smooth_max:
+        seed = int(torch.randint(2**31, (), generator=generator))
+        coefficients = mr2.phantoms.random_b0_sh_coefficients(max_degree=4, sigma=1.0, seed=seed)
+        coefficients[3:8] *= degree_two_scale  # Five degree-two terms, following three degree-one terms.
+        field = mr2.phantoms.b0map_from_sh_coefficients(
+            mr2.data.SpatialDimension(1, *foreground.shape),
+            mr2.data.SpatialDimension(0.0, 1.0, 1.0),
+            coefficients,
+        )[0].float()
+        field -= field[foreground].mean()
+        field /= field[foreground].abs().max().clamp_min(1e-6)
+        strength = smooth_min + (smooth_max - smooth_min) * torch.rand((), generator=generator)
+        multiplier += strength * field
+    if noise_fraction:
+        field = torch.zeros_like(multiplier)
+        for spacing, weight in ((20.0, 4 / 9), (10.0, 3 / 9), (6.0, 2 / 9)):
+            spacing *= 0.75 + 0.5 * torch.rand((), generator=generator).item()
+            shape = tuple(max(2, round(size / spacing)) for size in foreground.shape)
+            grid = torch.randn((1, 1, *shape), generator=generator)
+            smooth = torch.nn.functional.interpolate(grid, size=foreground.shape, mode='bicubic', align_corners=False)[
+                0, 0
+            ]
+            smooth = (smooth - smooth[foreground].mean()) / smooth[foreground].std(unbiased=False).clamp_min(1e-6)
+            field += weight * smooth.tanh()
+        multiplier += noise_fraction * torch.rand((), generator=generator) * field
+    radial_min, radial_max = radial_fraction if isinstance(radial_fraction, tuple) else (0.0, radial_fraction)
+    if radial_max:
+        coordinates = torch.nonzero(foreground).float()
+        lower, upper = coordinates.amin(dim=0), coordinates.amax(dim=0)
+        centre = (lower + upper) / 2
+        radii = ((upper - lower) / 2).clamp_min(1)
+        y, x = torch.meshgrid(
+            torch.arange(foreground.shape[0], dtype=torch.float32),
+            torch.arange(foreground.shape[1], dtype=torch.float32),
+            indexing='ij',
+        )
+        radius_squared = ((y - centre[0]) / radii[0]) ** 2 + ((x - centre[1]) / radii[1]) ** 2
+        strength = radial_min + (radial_max - radial_min) * torch.rand((), generator=generator)
+        multiplier *= 1 + strength * radius_squared.clamp(max=1)
+    return torch.where(foreground, multiplier, 1).reshape_as(mask)
+
+
 class BrainwebDataset(torch.utils.data.Dataset):
     """BrainWeb-based dataset for parameter maps."""
 
@@ -291,140 +395,120 @@ class BrainwebDataset(torch.utils.data.Dataset):
         t1_bounds: tuple[float, float] = (0.1, 4.0),
         t2_bounds: tuple[float, float] = (0.01, 2.5),
         orientation: Sequence[Literal['axial', 'coronal', 'sagittal']] = ('axial',),
-        bias_field_downsample_factor: int | None = None,
-        bias_field_grid_size_range: tuple[int, int] = (2, 16),
-        m0_bias_range: tuple[float, float] = (0.7, 1.3),
-        m0_component_bias_range: tuple[float, float] = (0.9, 1.1),
-        t1_bias_range: tuple[float, float] = (0.9, 1.1),
-        t2_bias_range: tuple[float, float] = (0.9, 1.1),
-        phase_bias_range: tuple[float, float] = (-math.pi / 12, math.pi / 12),
-        polynomial_phase_amplitude_range: tuple[float, float] = (math.pi / 2, 2 * math.pi),
+        spatial_smooth_fraction: float = 0.4,
+        spatial_m0_smooth_range: tuple[float, float] = (0.2, 0.8),
+        spatial_m0_degree_two_scale: float = 2.0,
+        spatial_m0_radial_range: tuple[float, float] = (0.2, 0.8),
+        spatial_noise_fraction: float = 0.05,
+        spatial_phase_max_rad: float = 0.6,
         global_m0_magnitude_range: tuple[float, float] = (0.7, 1.3),
         random: bool = True,
     ) -> None:
-        """Initialize the dataset."""
-        if bias_field_downsample_factor is not None and bias_field_downsample_factor <= 0:
-            raise ValueError('bias_field_downsample_factor must be positive.')
-        if bias_field_grid_size_range[0] <= 0 or bias_field_grid_size_range[0] > bias_field_grid_size_range[1]:
-            raise ValueError('bias_field_grid_size_range must be a positive ascending range.')
-        if (
-            polynomial_phase_amplitude_range[0] < 0
-            or polynomial_phase_amplitude_range[0] > polynomial_phase_amplitude_range[1]
-        ):
-            raise ValueError('polynomial_phase_amplitude_range must be a non-negative ascending range.')
-        if random:
-            augment = mr2.phantoms.brainweb.augment(size=size)
-        else:
-            augment = mr2.phantoms.brainweb.augment(
-                size=size,
-                max_random_shear=0,
-                max_random_rotation=0,
-                max_random_scaling_factor=0,
-                p_horizontal_flip=0,
-                p_vertical_flip=1.0,
-            )
+        """Initialize MR2 affine and spherical-harmonic/multiscale map augmentation.
 
-        self.phantom = mr2.phantoms.brainweb.BrainwebSlices(
-            folder=folder,
-            what=('m0', 't1', 't2', 'mask'),
-            seed='index' if not random else 'random',
-            slice_preparation=augment,
-            parameters=BRAINWEB_VALUES_3T_RANDOMIZED,
-            orientation=orientation,
-        )
+        Independent M0, T1 and T2 fields combine smooth degree-four variation with
+        finer multiscale variation. M0 strength is drawn uniformly from its range;
+        T1 and T2 strengths are drawn from zero to the relaxation-map maximum.
+        M0 degree-two coefficients have twice the default spread; a separate quadratic
+        centre-to-edge multiplier adds 20 to 80% peripheral brightening by default.
+        Spatial phase uses degree two with the specified maximum strength in radians.
+        Validation uses the same map augmentation with fixed slice seeds.
+        """
+        if (
+            min(spatial_smooth_fraction, *spatial_m0_smooth_range, spatial_noise_fraction) < 0
+            or spatial_m0_smooth_range[0] > spatial_m0_smooth_range[1]
+            or max(spatial_smooth_fraction, spatial_m0_smooth_range[1]) + spatial_noise_fraction >= 1
+        ):
+            raise ValueError('Spatial magnitude fractions must be non-negative and sum to less than one.')
+        if (
+            spatial_m0_degree_two_scale < 0
+            or min(spatial_m0_radial_range) < 0
+            or spatial_m0_radial_range[0] > spatial_m0_radial_range[1]
+        ):
+            raise ValueError('M0 harmonic scaling and radial bounds must be non-negative, with ordered bounds.')
+        if spatial_phase_max_rad < 0:
+            raise ValueError('Spatial phase strength must be non-negative.')
         self.matrix_size = mr2.data.SpatialDimension(1, size, size)
         self.n_coils = n_coils
         self.noise = noise
         self.t1_bounds = t1_bounds
         self.t2_bounds = t2_bounds
-        self.bias_field_downsample_factor = bias_field_downsample_factor
-        self.bias_field_grid_size_range = bias_field_grid_size_range
-        self.m0_bias_range = m0_bias_range
-        self.m0_component_bias_range = m0_component_bias_range
-        self.t1_bias_range = t1_bias_range
-        self.t2_bias_range = t2_bias_range
-        self.phase_bias_range = phase_bias_range
-        self.polynomial_phase_amplitude_range = polynomial_phase_amplitude_range
+        self.spatial_smooth_fraction = spatial_smooth_fraction
+        self.spatial_m0_smooth_range = spatial_m0_smooth_range
+        self.spatial_m0_degree_two_scale = spatial_m0_degree_two_scale
+        self.spatial_m0_radial_range = spatial_m0_radial_range
+        self.spatial_noise_fraction = spatial_noise_fraction
+        self.spatial_phase_max_rad = spatial_phase_max_rad
         self.global_m0_magnitude_range = global_m0_magnitude_range
         self.random = random
+        self.folder = folder
+        self.orientation = tuple(orientation)
+        self._build_phantom()
 
-    def _smooth_random_field(
-        self,
-        rng: mr2.utils.RandomGenerator,
-        shape: tuple[int, int],
-        value_range: tuple[float, float],
-    ) -> torch.Tensor:
-        """Create a low-frequency 2D random field by upsampling a coarse grid."""
-        low, high = value_range
-        if low > high:
-            raise ValueError('value_range lower bound must not exceed the upper bound.')
-        if self.bias_field_downsample_factor is None:
-            min_grid_size, max_grid_size = self.bias_field_grid_size_range
-            coarse_shape = (
-                int(rng.int64(min_grid_size, max_grid_size + 1)),
-                int(rng.int64(min_grid_size, max_grid_size + 1)),
-            )
-        else:
-            coarse_shape = (
-                max(2, math.ceil(shape[0] / self.bias_field_downsample_factor)),
-                max(2, math.ceil(shape[1] / self.bias_field_downsample_factor)),
-            )
-        coarse_field = rng.float32_tensor((1, 1, *coarse_shape), low=low, high=high)
-        field = torch.nn.functional.interpolate(coarse_field, size=shape, mode='bicubic', align_corners=True).squeeze(
-            0, 1
+    def _build_phantom(self) -> None:
+        """Build augmentation and its random generator in the current process."""
+        augment = partial(prepare_brainweb_slice, size=self.matrix_size.x, random=self.random)
+        self.phantom = mr2.phantoms.brainweb.BrainwebSlices(
+            folder=self.folder,
+            what=('m0', 't1', 't2', 'mask'),
+            seed='index' if not self.random else 'random',
+            slice_preparation=augment,
+            parameters=BRAINWEB_VALUES_3T_RANDOMIZED,
+            orientation=self.orientation,
         )
-        return field.clamp(min=low, max=high)
 
-    def _polynomial_phase_field(
-        self,
-        rng: mr2.utils.RandomGenerator,
-        shape: tuple[int, int],
-    ) -> torch.Tensor:
-        """Create a very smooth random phase field with full-range phase variation."""
-        amplitude = rng.float32(*self.polynomial_phase_amplitude_range)
-        if amplitude == 0:
-            return torch.zeros(shape, dtype=torch.float32)
-        y = torch.linspace(-1.0, 1.0, shape[0], dtype=torch.float32)
-        x = torch.linspace(-1.0, 1.0, shape[1], dtype=torch.float32)
-        yy, xx = torch.meshgrid(y, x, indexing='ij')
-        coefficients = rng.float32_tensor((5,), low=-1.0, high=1.0)
-        field = (
-            coefficients[0] * xx
-            + coefficients[1] * yy
-            + coefficients[2] * xx * yy
-            + coefficients[3] * (xx.square() - xx.square().mean())
-            + coefficients[4] * (yy.square() - yy.square().mean())
-        )
-        field = field - field.mean()
-        field = field / field.abs().amax().clamp_min(torch.finfo(field.dtype).eps)
-        return amplitude * field
+    def __getstate__(self) -> dict:
+        """Rebuild process-local BrainWeb state when spawning a worker."""
+        return {key: value for key, value in self.__dict__.items() if key != 'phantom'}
+
+    def __setstate__(self, state: dict) -> None:
+        """Use the worker's default generator and avoid pickling local closures."""
+        self.__dict__.update(state)
+        self._build_phantom()
 
     def _augment_parameter_maps(
         self,
         m0: torch.Tensor,
         t1: torch.Tensor,
         t2: torch.Tensor,
+        mask: torch.Tensor,
         rng: mr2.utils.RandomGenerator,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply smooth multiplicative and phase augmentations to synthetic parameter maps."""
-        spatial_shape = (m0.shape[-2], m0.shape[-1])
-        m0_bias = self._smooth_random_field(rng, spatial_shape, self.m0_bias_range)
-        m0_real_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
-        m0_imag_bias = self._smooth_random_field(rng, spatial_shape, self.m0_component_bias_range)
-        t1_bias = self._smooth_random_field(rng, spatial_shape, self.t1_bias_range).to(t1.dtype)
-        t2_bias = self._smooth_random_field(rng, spatial_shape, self.t2_bias_range).to(t2.dtype)
-        phase_bias = self._smooth_random_field(rng, spatial_shape, self.phase_bias_range)
-        polynomial_phase = self._polynomial_phase_field(rng, spatial_shape)
+        """Apply independent spatial magnitude fields and a shared signal phase."""
+        m0, t1, t2 = (
+            image
+            * spatial_parameter_multiplier(
+                mask,
+                smooth_fraction,
+                self.spatial_noise_fraction,
+                rng.generator,
+                degree_two_scale=degree_two_scale,
+                radial_fraction=radial_fraction,
+            )
+            for image, smooth_fraction, degree_two_scale, radial_fraction in (
+                (m0, self.spatial_m0_smooth_range, self.spatial_m0_degree_two_scale, self.spatial_m0_radial_range),
+                (t1, self.spatial_smooth_fraction, 1.0, 0.0),
+                (t2, self.spatial_smooth_fraction, 1.0, 0.0),
+            )
+        )
+        if self.spatial_phase_max_rad and mask.any():
+            seed = int(torch.randint(2**31, (), generator=rng.generator))
+            phase = mr2.phantoms.random_b0map(
+                self.matrix_size,
+                mr2.data.SpatialDimension(0.0, 1.0, 1.0),
+                l_max=2,
+                sigma_ppm=1.0,
+                seed=seed,
+            ).float()[0]
+            foreground = mask.squeeze().bool()
+            phase -= phase[foreground].mean()
+            phase /= torch.quantile(phase[foreground].abs(), 0.9).clamp_min(1e-6)
+            strength = self.spatial_phase_max_rad * torch.rand((), generator=rng.generator)
+            m0 = m0 * torch.polar(torch.ones_like(phase), strength * phase)
         global_magnitude = rng.float32(*self.global_m0_magnitude_range)
         global_phase = rng.float32(-math.pi, math.pi)
         global_scale = torch.polar(torch.tensor(global_magnitude, dtype=torch.float32), torch.tensor(global_phase))
-        phase = phase_bias + polynomial_phase
-        m0 = m0.to(torch.complex64) * m0_bias.to(torch.complex64) * torch.exp(1j * phase).to(torch.complex64)
-        m0 = torch.complex(m0.real * m0_real_bias, m0.imag * m0_imag_bias)
-        m0 = m0 * global_scale.to(torch.complex64)
-        t1 = (t1 * t1_bias).clamp_min(torch.finfo(t1.dtype).eps)
-        t2 = (t2 * t2_bias).clamp_min(torch.finfo(t2.dtype).eps)
-        return m0, t1, t2
+        return m0 * global_scale, t1, t2
 
     def __len__(self) -> int:
         """Return the number of available slices."""
@@ -438,7 +522,7 @@ class BrainwebDataset(torch.utils.data.Dataset):
         m0 = phantom['m0']
         t1 = phantom['t1']
         t2 = phantom['t2']
-        m0, t1, t2 = self._augment_parameter_maps(m0, t1, t2, rng)
+        m0, t1, t2 = self._augment_parameter_maps(m0, t1, t2, phantom['mask'], rng)
 
         return {
             'm0': m0,
