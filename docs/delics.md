@@ -2,7 +2,7 @@
 
 The default is the simple DELICS-only recipe: four PINQI stages, eight slices per batch, normalized log-L1 for T1/T2 with equal weights, P90-normalized M0 magnitude MSE (weight 0.5), and an outside-mask M0 penalty (weight 0.1). Deep supervision weights are 0.2/0.1/0.1/0.8. There is no auxiliary image loss or SSIM training loss.
 
-The acquisition uses 352 spokes, 256×256 images, eight coils and ten subspace coefficients. Image U-Net widths are 48/64/96/128 and parameter U-Net widths are 64/128/192/256. Training retains the existing geometry, bias-field and noise augmentation, detached CG warm starts, EMA, clipping, and 80-epoch AdamW schedule. The default peak network LR is 3e-4 with scalar multiplier 2 and weight decay 1e-3. The earlier LR comparisons remain selectable with `--model.lr 0.00015` or `--model.lr 0.0006`.
+The acquisition uses 352 spokes, 256×256 images, eight coils and ten subspace coefficients. Image U-Net widths are 48/64/96/128 and parameter U-Net widths are 64/128/192/256. Training retains the existing geometry, bias-field and noise augmentation, detached CG warm starts, EMA, clipping, and 80-epoch AdamW schedule. The default peak network LR is 3e-4 with scalar multiplier 2 and weight decay 1e-3.
 
 ## Data preparation
 
@@ -32,7 +32,7 @@ Run each fold from scratch. For example, hold out case003:
 
 Repeat with each of case000–case009 to obtain all ten folds. `--output` changes the common output root. CSV logs, the resolved config and checkpoints are separated by held-out subject. `--wandb` adds optional W&B metrics and reference/baseline/prediction figures.
 
-Fitting runs for the fixed epoch count without evaluating the held-out subject. It saves the full final state as `checkpoints/last.ckpt`; no held-out metric selects a checkpoint. Standalone `validate` evaluates that final state with EMA weights. Resume an interrupted fold with the same held-out subject and `--ckpt_path`; checkpoints record the cohort and fold and reject a different fold. Do not initialize one fold from another fold's model.
+Fitting runs for the fixed epoch count without evaluating the held-out subject. It saves the full final state as `checkpoints/last.ckpt`; no held-out metric selects a checkpoint. Standalone `validate` evaluates that final state with EMA weights. Fresh training refuses an output folder that already contains checkpoints, and validation requires an explicit checkpoint. Resume an interrupted fold with the same held-out subject and `--ckpt_path`; checkpoints record the cohort and fold and reject a different fold. Do not initialize one fold from another fold's model.
 
 Freeze learning rate, epoch count and other recipe choices before running the final folds. The cohort already informed earlier recipe development, so describe this as leave-one-subject-out agreement with full-acquisition reference maps, not an independent external test or ground-truth accuracy study.
 

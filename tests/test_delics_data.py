@@ -21,7 +21,7 @@ def _write_delics_radial(path: Path, case_id: str = 'case001', valid: np.ndarray
     reference_t1 = np.full((n_slices, 6, 7), 1.2, dtype=np.float32)
     reference_t2 = np.full((n_slices, 6, 7), 0.08, dtype=np.float32)
     with h5py.File(path, 'w') as handle:
-        handle.attrs['case'] = case_id
+        handle.attrs.update(case=case_id, kspace_scale=1.0, source_file=f'{case_id}-source.h5')
         handle.create_dataset('kspace', data=kspace)
         handle.create_dataset('mask', data=mask)
         handle.create_dataset('csm_initial', data=csm_initial)
@@ -84,6 +84,7 @@ def test_delics_leave_one_out_split(tmp_path: Path, held_out: str, monkeypatch: 
         _write_delics_radial(tmp_path / f'delics_radial_{case}.h5', case_id=case)
         with h5py.File(frames / f'{case}-t3-c4.h5', 'w') as cache:
             group = cache.create_group('z000')
+            group.attrs.update(signal_scale=1.0, source_file=f'{case}-source.h5')
             packed = np.zeros((3, 4, 6, 7), dtype=[('r', '<f2'), ('i', '<f2')])
             group['frames'] = packed
             for name in ('m0', 't1', 't2'):
@@ -121,3 +122,15 @@ def test_delics_leave_one_out_split(tmp_path: Path, held_out: str, monkeypatch: 
     other = next(case for case in DELICS_CASES if case != held_out)
     with pytest.raises(ValueError, match='different DELICS fold'):
         data.load_state_dict({'case_ids': DELICS_CASES, 'held_out_case': other})
+
+
+def test_delics_rejects_stale_frame_cache(tmp_path: Path) -> None:
+    """Reject frame data prepared from a different reconstruction or signal scale."""
+    from pinqi_mrf.delics_frames import DelicsFrameDataset
+
+    _write_delics_radial(tmp_path / 'delics_radial_case001.h5')
+    with h5py.File(tmp_path / 'case001-t3-c4.h5', 'w') as cache:
+        cache.create_group('z000').attrs.update(signal_scale=2.0, source_file='case001-source.h5')
+    reference = DelicsRadialDataset(tmp_path, case_ids=('case001',))
+    with pytest.raises(ValueError, match='provenance differs'):
+        DelicsFrameDataset(reference, tmp_path, n_timepoints=3, n_coils=4)

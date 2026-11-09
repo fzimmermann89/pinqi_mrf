@@ -197,7 +197,7 @@ class SupervisedModule(pl.LightningModule):
         state_dict = checkpoint.get('state_dict')
         if isinstance(state_dict, dict):
             for key in tuple(state_dict):
-                if key.startswith(('subspace_gram.', 'noise_sampler.', 'current_subspace_gram_in.')):
+                if key.startswith('subspace_gram.'):
                     del state_dict[key]
 
     def on_load_checkpoint(self, checkpoint: dict[str, object]) -> None:
@@ -998,6 +998,10 @@ class DelicsCLI(LightningCLI):
         """Separate fold artifacts and keep the held-out subject out of fitting."""
         config = getattr(self.config, self.subcommand)
         run_dir = Path(config.output) / config.data.held_out_case
+        if self.subcommand == 'validate' and not config.ckpt_path:
+            raise ValueError('Validation requires --ckpt_path for this fold.')
+        if self.subcommand == 'fit' and not config.ckpt_path and any((run_dir / 'checkpoints').glob('*')):
+            raise ValueError('This fold already has checkpoints; resume with --ckpt_path or choose a new --output.')
         loggers = [
             Namespace(
                 class_path='lightning.pytorch.loggers.CSVLogger',

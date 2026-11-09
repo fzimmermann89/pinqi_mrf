@@ -60,11 +60,19 @@ class DelicsFrameDataset(torch.utils.data.Dataset[DelicsFrameBatch]):
         self.n_timepoints = n_timepoints
         self.n_coils = n_coils
         self.noise = noise
-        for file_index, (_path, case) in enumerate(self.files):
-            with h5py.File(self.cache_path(case), 'r') as cached:
+        for file_index, (path, case) in enumerate(self.files):
+            with h5py.File(path, 'r') as radial, h5py.File(self.cache_path(case), 'r') as cached:
                 for file, slice_index in self.samples:
-                    if file == file_index and f'z{slice_index:03d}' not in cached:
+                    if file != file_index:
+                        continue
+                    if f'z{slice_index:03d}' not in cached:
                         raise ValueError(f'Missing frame cache for {case}, slice {slice_index}.')
+                    group = cached[f'z{slice_index:03d}']
+                    if (group.attrs['signal_scale'], group.attrs['source_file']) != (
+                        radial.attrs['kspace_scale'],
+                        radial.attrs['source_file'],
+                    ):
+                        raise ValueError(f'Frame cache provenance differs from the radial cache: {case}.')
 
     def cache_path(self, case: str) -> Path:
         """Return the cache path for this temporal prefix and coil count."""

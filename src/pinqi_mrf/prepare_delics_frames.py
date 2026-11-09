@@ -20,7 +20,7 @@ def save_slice(
     """Write a slice group with LZF-compressed complex-half frame chunks.
 
     Reference M0 remains complex64, T1/T2 float32, and the mask boolean.
-    Complex-half frames use two IEEE float16 fields, named real and imaginary.
+    Complex-half frames use two IEEE float16 fields, named r and i.
     """
     shape = tuple(frames.shape)
     dtype = np.dtype([('r', '<f2'), ('i', '<f2')])
